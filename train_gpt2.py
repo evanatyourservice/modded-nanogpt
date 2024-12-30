@@ -7,6 +7,7 @@ import time
 import contextlib
 from dataclasses import dataclass
 from pathlib import Path
+from functools import partial
 
 import torch
 from torch import nn
@@ -15,6 +16,10 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.attention.flex_attention import BlockMask, flex_attention #KoszarskyB
+
+import wandb
+from heavyball import ForeachPSGDKron
+from heavyball.utils import rmsnorm_clip_
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -411,7 +416,7 @@ class Hyperparameters:
     input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 8 # batch size, in sequences, across all devices
+    batch_size : int = 2 # batch size, in sequences, across all devices
     sequence_length : int = 64*1024 # sequence length, in tokens
     num_iterations : int = 1480 # number of iterations to run
     warmup_iters : int = 0
@@ -420,6 +425,14 @@ class Hyperparameters:
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+
+    use_kron: bool = False
+    kron_lr: float = 0.001
+
+    # wandb config
+    wandb_project: str = "gpt-speedrun"
+    wandb_log: bool = True
+
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -433,6 +446,9 @@ print(f'using device: {device}')
 dist.init_process_group(backend='nccl', device_id=device)
 dist.barrier()
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
+
+if master_process and args.wandb_log:
+    wandb.init(project=args.wandb_project, config=vars(args))
 
 # begin logging
 logfile = None
@@ -493,15 +509,34 @@ model = DDP(model, device_ids=[ddp_local_rank], broadcast_buffers=False, gradien
 raw_model = model.module # always contains the "raw" unwrapped model
 
 # init the optimizer(s)
-embed_params = [*raw_model.embed.parameters(), *raw_model.value_embeds.parameters()]
-optimizer1 = torch.optim.Adam(embed_params, lr=0.6, betas=(0.8, 0.95), fused=True)
-optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 0.95), fused=True)
-params = list(raw_model.blocks.parameters())
-matrix_params = [p for p in params if p.ndim == 2]
-scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
-optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
-optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True)
-optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
+if args.use_kron:
+    # Use single Kron optimizer for all parameters
+    all_params = list(model.parameters())
+    optimizer = ForeachPSGDKron(
+        all_params,
+        lr=args.kron_lr,
+        max_size_triangular=25000,
+        min_ndim_triangular=0,
+        merge_dims=True,
+        store_triu_as_line=False,
+        stochastic_schedule=False,
+        update_clipping=partial(rmsnorm_clip_, clip=1.1),
+        precond_init_scale=2.0,
+        precond_lr=0.4,
+    )
+    optimizers = [optimizer]
+else:
+    # Use multiple optimizers as before
+    embed_params = [*raw_model.embed.parameters(), *raw_model.value_embeds.parameters()]
+    optimizer1 = torch.optim.Adam(embed_params, lr=0.6, betas=(0.8, 0.95), fused=True)
+    optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 0.95), fused=True)
+    params = list(raw_model.blocks.parameters())
+    matrix_params = [p for p in params if p.ndim == 2]
+    scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
+    optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
+    optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True)
+    optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
+
 # learning rate decay scheduler (linear warmup and cooldown)
 def get_lr(it):
     assert it <= args.num_iterations
@@ -596,10 +631,11 @@ for step in range(args.num_iterations + 1):
     if train_accumulation_steps != 1:
         for p in model.parameters():
             p.grad /= train_accumulation_steps
-    # momentum warmup for Muon
-    frac = min(step/300, 1)
-    for group in optimizer3.param_groups:
-        group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+    # momentum warmup for Muon (skip if using Kron)
+    if not args.use_kron:
+        frac = min(step/300, 1)
+        for group in optimizer3.param_groups:
+            group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
@@ -610,6 +646,19 @@ for step in range(args.num_iterations + 1):
     # everything that follows now is just diagnostics, prints, logging, etc.
     approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{args.num_iterations} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+
+    if master_process and args.wandb_log:
+        metrics = {
+            "val/loss": val_loss.item(),
+            "train/step": step,
+            "train/progress": step / args.num_iterations,
+            "system/train_time_ms": approx_time,
+            "system/step_time_ms": approx_time/timed_steps if step > 11 else 0,
+        }
+        for i, scheduler in enumerate(schedulers):
+            metrics[f"train/lr_{i}"] = scheduler.get_last_lr()[0]
+        
+        wandb.log(metrics, step=step)
 
 print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 

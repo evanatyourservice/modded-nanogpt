@@ -8,6 +8,7 @@ import contextlib
 from dataclasses import dataclass
 from pathlib import Path
 from functools import partial
+from pprint import pprint
 
 import torch
 from torch import nn
@@ -449,6 +450,8 @@ master_process = (ddp_rank == 0) # this process will do logging, checkpointing e
 
 if master_process and args.wandb_log:
     wandb.init(project=args.wandb_project, config=vars(args))
+
+pprint(args)
 
 # begin logging
 logfile = None

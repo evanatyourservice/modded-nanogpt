@@ -25,7 +25,7 @@ from heavyball.utils import rmsnorm_clip_, precond_update_prob_schedule
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
-# @torch.compile
+@torch.compile
 def zeropower_via_newtonschulz5(G, steps):
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
@@ -418,7 +418,7 @@ class Hyperparameters:
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 1 # batch size, in sequences, across all devices
-    sequence_length : int = 32*1024 # 64*1024 # sequence length, in tokens
+    sequence_length : int = 16*1024 # 64*1024 # sequence length, in tokens
     num_iterations : int = 1480 # number of iterations to run
     warmup_iters : int = 0
     cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
@@ -506,7 +506,7 @@ for m in model.modules():
     if isinstance(m, CastedLinear):
         m.float()
 config.coordinate_descent_tuning = True # suggested by @Chillee
-# model = torch.compile(model)
+model = torch.compile(model)
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
 raw_model = model.module # always contains the "raw" unwrapped model

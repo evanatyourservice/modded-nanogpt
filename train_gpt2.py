@@ -20,7 +20,7 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention #Koszars
 
 import wandb
 from heavyball import ForeachPSGDKron
-from heavyball.utils import rmsnorm_clip_
+from heavyball.utils import rmsnorm_clip_, precond_update_prob_schedule
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -518,14 +518,16 @@ if args.use_kron:
     optimizer = ForeachPSGDKron(
         all_params,
         lr=args.kron_lr,
+        precond_update_prob_schedule=precond_update_prob_schedule(
+            min_prob=0.03,  # 0.03 is default
+        ),
         max_size_triangular=25000,
-        min_ndim_triangular=0,
         merge_dims=True,
         store_triu_as_line=False,
         stochastic_schedule=False,
         update_clipping=partial(rmsnorm_clip_, clip=1.1),
-        precond_init_scale=2.0,
-        precond_lr=0.4,
+        precond_init_scale=2.0,  # 1.0 is default
+        precond_lr=0.4,  # 0.1 is default
     )
     optimizers = [optimizer]
 else:

@@ -418,7 +418,7 @@ class Hyperparameters:
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 1 # batch size, in sequences, across all devices
-    sequence_length : int = 64*1024 # sequence length, in tokens
+    sequence_length : int = 32*1024 # 64*1024 # sequence length, in tokens
     num_iterations : int = 1480 # number of iterations to run
     warmup_iters : int = 0
     cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule

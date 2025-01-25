@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+import wandb
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -199,7 +200,7 @@ class Nuon(torch.optim.Optimizer):
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         ns_steps: The number of Newton-Schulz iteration steps to use.
     """
-    def __init__(self, params, lr=0.001, momentum=0.9, nesterov=True, ns_steps=5, rank=0, world_size=1):
+    def __init__(self, params, lr=0.001, momentum=0.9, nesterov=False, ns_steps=5, rank=0, world_size=1):
         self.rank = rank
         self.world_size = world_size
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
@@ -247,7 +248,17 @@ class Nuon(torch.optim.Optimizer):
                     buf: Tensor = state["momentum_buffer"]
                     buf.lerp_(g, 1 - momentum)
                     g = g.lerp_(buf, momentum) if nesterov else buf
-                    g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
+                    m, n = g.shape
+                    if m<n:
+                        g = g.T
+                    if 'Q' not in state:
+                        state['Q'] = torch.eye(g.shape[1], dtype=torch.bfloat16, device=g.device)
+                    Q = state['Q']
+                    Q = psgd_whitening_like_muon(g, Q)
+                    state['Q'] = Q
+                    g = g @ Q.T @ Q                
+                    if m<n:
+                        g = g.T
                 else:
                     g = update_buffer_views[self.rank]
                 update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
@@ -491,6 +502,8 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
 # -----------------------------------------------------------------------------
 # int main
 
+multiplier = 8  # useful for when there are less than 8 GPUs
+
 @dataclass
 class Hyperparameters:
     # data
@@ -498,13 +511,25 @@ class Hyperparameters:
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # optimization
-    batch_size = 8*64*1024 # batch size in tokens
+    batch_size = 8*64*1024 * multiplier # batch size in tokens
     num_iterations = 7500 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
+    # muon optimizer settings
+    muon_lr = 0.025
+    muon_momentum = 0.95
+    muon_ns_steps = 5
+    # adam optimizer settings
+    head_lr = 0.003
+    embed_lr = 0.3
+    scalar_lr = 0.015
+    adam_beta1 = 0.8
+    adam_beta2 = 0.95
+    adam_eps = 1e-10
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    wandb_project = "nanogpt"
     # implementation
-    seq_len = 64*1024 # FlexAttention sequence length
+    seq_len = 64*1024 // multiplier # FlexAttention sequence length
     save_checkpoint = False
 args = Hyperparameters()
 
@@ -525,6 +550,36 @@ if master_process:
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id}.txt"
     print(logfile)
+    wandb.init(
+        project=args.wandb_project,
+        config={
+            # data and training
+            "batch_size": args.batch_size,
+            "num_iterations": args.num_iterations,
+            "cooldown_frac": args.cooldown_frac,
+            "val_loss_every": args.val_loss_every,
+            "seq_len": args.seq_len,
+            "val_tokens": args.val_tokens,
+            # model architecture
+            "vocab_size": 50257,
+            "num_layers": 16,
+            "num_heads": 8,
+            "model_dim": 1024,
+            # muon optimizer
+            "muon_lr": args.muon_lr,
+            "muon_momentum": args.muon_momentum,
+            "muon_ns_steps": args.muon_ns_steps,
+            # adam optimizer
+            "head_lr": args.head_lr,
+            "embed_lr": args.embed_lr,
+            "scalar_lr": args.scalar_lr,
+            "adam_beta1": args.adam_beta1,
+            "adam_beta2": args.adam_beta2,
+            "adam_eps": args.adam_eps,
+            # hardware
+            "world_size": world_size,
+        }
+    )
 def print0(s, console=False):
     if master_process:
         with open(logfile, "a") as f:
@@ -561,11 +616,11 @@ scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 
 # init the optimizer(s)
-adam_params = [dict(params=head_params, lr=0.003), dict(params=embed_params, lr=0.3), dict(params=scalar_params, lr=0.015)]
+adam_params = [dict(params=head_params, lr=args.head_lr), dict(params=embed_params, lr=args.embed_lr), dict(params=scalar_params, lr=args.scalar_lr)]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), fused=True, eps=1e-10)
-optimizer2 = Nuon(hidden_matrix_params, lr=0.001, momentum=0.9, rank=rank, world_size=world_size)
+optimizer1 = torch.optim.Adam(adam_params, betas=(args.adam_beta1, args.adam_beta2), fused=True, eps=args.adam_eps)
+optimizer2 = Nuon(hidden_matrix_params, lr=args.muon_lr, momentum=args.muon_momentum, ns_steps=args.muon_ns_steps, rank=rank, world_size=world_size)
 optimizers = [optimizer1, optimizer2]
 
 # learning rate schedule: stable then decay
@@ -618,6 +673,8 @@ for step in range(train_steps + 1):
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms", console=True)
+        if master_process:
+            wandb.log({"val_loss": val_loss.item(), "step": step, "train_time_ms": training_time_ms, "step_time_ms": training_time_ms/(timed_steps-1)})
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -638,9 +695,9 @@ for step in range(train_steps + 1):
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
     # momentum warmup for Muon
-    frac = min(step / 300, 1)
-    for group in optimizer2.param_groups:
-        group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+    # frac = min(step / 300, 1)
+    # for group in optimizer2.param_groups:
+    #     group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
@@ -655,4 +712,6 @@ print0(
     f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
     f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
 )
+if master_process:
+    wandb.finish()
 dist.destroy_process_group()

@@ -107,43 +107,6 @@ def lm_head_fp8(x: Tensor, w: Tensor) -> Tensor:
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
-def _lb(A: Tensor, max_abs: Tensor):
-    A = A / max_abs
-    aa = torch.real(A * A)
-    value0, i = torch.max(torch.sum(aa, dim=0), 0)
-    value1, j = torch.max(torch.sum(aa, dim=1), 0)
-    if value0 > value1:
-        x = A[:, i] @ A
-        return max_abs * torch.linalg.vector_norm(
-            (x / torch.linalg.vector_norm(x)) @ A.H
-        )
-    else:
-        x = A @ A[j]
-        return max_abs * torch.linalg.vector_norm(
-            A.H @ (x / torch.linalg.vector_norm(x))
-        )
-
-@torch.compiler.disable
-def norm_lower_bound(A: Tensor):
-    """Cheap lower bound for the spectral norm of A."""
-    max_abs = A.norm(float("inf"))
-    return torch.where(max_abs > 0, _lb(A, max_abs), max_abs)
-
-@torch.compile
-def psgd_whitening_like_muon(G: Tensor, Q: Tensor):
-    G = G.bfloat16()
-    assert Q.dtype == torch.bfloat16, "please keep Q in bfloat16"
-    lr = torch.tensor(0.5, dtype=torch.bfloat16)
-    m, n = G.shape
-    assert(m >= n)
-    V = torch.randn_like(G)/m**0.5
-    A = G @ Q.T
-    Bh = torch.linalg.solve_triangular(Q.float(), V.float(), upper=True, left=False).bfloat16()  # roughly same complexity as a matmul
-    AhA = A.T @ A
-    BBh = Bh.T @ Bh
-    Q = Q - lr/norm_lower_bound(AhA + BBh) * torch.triu(AhA - BBh) @ Q
-    return Q
-
 @torch.compile
 def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     """
@@ -173,10 +136,8 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
         X = X.mT
     return X
 
-class Nuon(torch.optim.Optimizer):
+class Muon(torch.optim.Optimizer):
     """
-    Almost Muon, but Not.
-
     Muon - MomentUm Orthogonalized by Newton-schulz
 
     Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
@@ -199,7 +160,7 @@ class Nuon(torch.optim.Optimizer):
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         ns_steps: The number of Newton-Schulz iteration steps to use.
     """
-    def __init__(self, params, lr=0.001, momentum=0.9, nesterov=True, ns_steps=5, rank=0, world_size=1):
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1):
         self.rank = rank
         self.world_size = world_size
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
@@ -491,6 +452,8 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
 # -----------------------------------------------------------------------------
 # int main
 
+multiplier = 8
+
 @dataclass
 class Hyperparameters:
     # data
@@ -498,13 +461,13 @@ class Hyperparameters:
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # optimization
-    batch_size = 8*64*1024 # batch size in tokens
+    batch_size = 8*64*1024 * multiplier # batch size in tokens
     num_iterations = 7500 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     # implementation
-    seq_len = 64*1024 # FlexAttention sequence length
+    seq_len = 64*1024 // multiplier # FlexAttention sequence length
     save_checkpoint = False
 args = Hyperparameters()
 
@@ -565,7 +528,7 @@ adam_params = [dict(params=head_params, lr=0.003), dict(params=embed_params, lr=
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), fused=True, eps=1e-10)
-optimizer2 = Nuon(hidden_matrix_params, lr=0.001, momentum=0.9, rank=rank, world_size=world_size)
+optimizer2 = Muon(hidden_matrix_params, lr=0.025, momentum=0.95, rank=rank, world_size=world_size)
 optimizers = [optimizer1, optimizer2]
 
 # learning rate schedule: stable then decay

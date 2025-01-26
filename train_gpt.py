@@ -109,7 +109,7 @@ def lm_head_fp8(x: Tensor, w: Tensor) -> Tensor:
 # Muon optimizer
 
 PRECOND_DTYPE = torch.float32  # probably could just do bf16 but i'm going to default
-# to keeping buffer in f32, but doing much of the preconditioner update in bf16 anyway
+# to keeping buffer in f32 with doing much of the preconditioner update in bf16 anyway
 
 def _lb(A: Tensor, max_abs: Tensor):
     A = A / max_abs
@@ -134,12 +134,12 @@ def psgd_whitening_like_muon(G: Tensor, Q: Tensor):
     V = torch.randn_like(G, dtype=torch.float32)
     Bh = torch.linalg.solve_triangular(Q.float(), V, upper=True, left=False).bfloat16()  # roughly same complexity as a matmul
     BBh = Bh.T @ Bh
-    A = G @ Q.T.bfloat16()
+    A = G @ Q.bfloat16().T
     AhA = A.T @ A
-    lr = torch.tensor(0.3, dtype=PRECOND_DTYPE)
+    lr = torch.tensor(0.4, dtype=PRECOND_DTYPE)
     Q = Q - lr / norm_lower_bound(AhA + BBh).to(PRECOND_DTYPE) * torch.triu(AhA.to(PRECOND_DTYPE) - BBh.to(PRECOND_DTYPE)) @ Q
 
-    # precondition grads
+    # precondition grads in bf16
     Q_in = Q.bfloat16()
     G = torch.einsum('ij,kj,kl->il', G, Q_in, Q_in)
 
@@ -188,7 +188,7 @@ class Nuon(torch.optim.Optimizer):
         ns_steps: The number of Newton-Schulz iteration steps to use.
         start_sparse_precond_updates: When to stop updating the preconditioner every step.
     """
-    def __init__(self, params, lr=0.001, momentum=0.9, nesterov=False, ns_steps=5, 
+    def __init__(self, params, lr=0.0003, momentum=0.9, nesterov=False, ns_steps=5, 
                  start_sparse_precond_updates=1000, weight_decay=0.0, rank=0, world_size=1):
         self.rank = rank
         self.world_size = world_size
@@ -249,7 +249,7 @@ class Nuon(torch.optim.Optimizer):
                     if 'Q' not in state:
                         state['Q'] = torch.eye(min(g.shape), dtype=PRECOND_DTYPE, device=g.device)
                     # we don't have to update precond every step once loss is stable
-                    if step < start_sparse_precond_updates or (step >= start_sparse_precond_updates and step % 5 == 0):
+                    if step < start_sparse_precond_updates or (step >= start_sparse_precond_updates and step % 4 == 0):
                         # update preconditioner and precondition grads
                         g, Q = psgd_whitening_like_muon(g, state['Q'])
                         state['Q'] = Q
@@ -529,7 +529,7 @@ class Hyperparameters:
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # muon optimizer settings
     muon_lr = 0.0005
-    muon_momentum = 0.9
+    muon_momentum = 0.85
     muon_ns_steps = 5
     muon_weight_decay = 0.1
     start_sparse_precond_updates = 2000

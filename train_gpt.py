@@ -109,9 +109,6 @@ def lm_head_fp8(x: Tensor, w: Tensor) -> Tensor:
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
-PRECOND_DTYPE = torch.float32  # probably could just do bf16, defaulting to f32 but
-# doing most of precond update in bf16 anyway
-
 def _lb(A: Tensor, max_abs: Tensor):
     A = A / max_abs
     x = A[:, torch.max(torch.sum(A * A, dim=0), 0)[1]] @ A
@@ -120,7 +117,6 @@ def _lb(A: Tensor, max_abs: Tensor):
 @torch.compiler.disable
 def norm_lower_bound(A: Tensor):
     """Cheap lower bound for the spectral norm of A."""
-    A = A.float()
     max_abs = A.norm(float("inf"))
     return torch.where(max_abs > 0, _lb(A, max_abs), max_abs)
 
@@ -137,8 +133,8 @@ def psgd_whitening_like_muon(G: Tensor, Q: Tensor):
     BBh = Bh.T @ Bh
     A = G @ Q.bfloat16().T
     AhA = A.T @ A
-    lr = torch.tensor(0.4, dtype=PRECOND_DTYPE)
-    Q = Q - lr / norm_lower_bound(AhA + BBh).to(PRECOND_DTYPE) * torch.triu(AhA.to(PRECOND_DTYPE) - BBh.to(PRECOND_DTYPE)) @ Q
+    lr = torch.tensor(0.3, dtype=torch.bfloat16)
+    Q = Q - lr / norm_lower_bound(AhA + BBh) * torch.triu(AhA - BBh) @ Q
 
     # precondition grads in bf16
     Q_in = Q.bfloat16()
@@ -147,7 +143,7 @@ def psgd_whitening_like_muon(G: Tensor, Q: Tensor):
     if m < n:
         G = G.T
     assert G.dtype == torch.bfloat16
-    assert Q.dtype == PRECOND_DTYPE, "something went wrong, Q is no longer in preconditioner_dtype"
+    assert Q.dtype == torch.bfloat16
     return G, Q
 
 @torch.compile
@@ -248,15 +244,17 @@ class Nuon(torch.optim.Optimizer):
                     orig_shape = g.shape
                     g: Tensor = g.view(-1, orig_shape[-1])
                     if 'Q' not in state:
-                        state['Q'] = torch.eye(min(g.shape), dtype=PRECOND_DTYPE, device=g.device)
+                        state['Q'] = torch.eye(min(g.shape), dtype=torch.bfloat16, device=g.device)
                     # we don't have to update precond every step once loss is stable
-                    if step < start_sparse_precond_updates or (step >= start_sparse_precond_updates and step % 4 == 0):
+                    if step < start_sparse_precond_updates or (step >= start_sparse_precond_updates and step % 5 == 0):
                         # update preconditioner and precondition grads
                         g, Q = psgd_whitening_like_muon(g, state['Q'])
                         state['Q'] = Q
                     else:
                         # precondition grads
                         g = psgd_precondition_grads(g, state['Q'])
+                    assert state['Q'].dtype == torch.bfloat16
+                    assert g.dtype == torch.bfloat16
                     rms = g.square().mean().sqrt()
                     if step % 250 == 0:
                         print(f"RMS for shape {g.shape}: {rms}")
@@ -276,7 +274,7 @@ class Nuon(torch.optim.Optimizer):
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
-USE_WANG_INIT = False  # trying tiny init in place of zero init
+USE_WANG_INIT = True  # trying tiny init in place of zero init
 
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int):
@@ -530,9 +528,9 @@ class Hyperparameters:
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # muon optimizer settings
     muon_lr = 0.0005
-    muon_momentum = 0.85
+    muon_momentum = 0.9
     muon_ns_steps = 5
-    muon_weight_decay = 0.1
+    muon_weight_decay = 0.01
     start_sparse_precond_updates = 2000
     # adam optimizer settings
     head_lr = 0.003

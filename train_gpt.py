@@ -127,8 +127,7 @@ def psgd_whitening_like_muon(G: Tensor, Q: Tensor):
     m, n = G.shape
     if m < n:
         G = G.T
-    # G = G / torch.sqrt(torch.tensor(G.size(0), dtype=torch.bfloat16))
-    V = torch.randn_like(G) # / torch.sqrt(torch.tensor(G.size(0), dtype=torch.bfloat16))
+    V = torch.randn_like(G) / torch.sqrt(torch.tensor(G.size(0), dtype=torch.bfloat16))
     A = G @ Q.T
     Bh = torch.linalg.solve_triangular(Q.float(), V.float(), upper=True, left=False).bfloat16()  # roughly same complexity as a matmul
     AhA = A.T @ A
@@ -151,35 +150,6 @@ def psgd_precondition_grads(G: Tensor, Q: Tensor):
     if m < n:
         G = G.T
     return G
-
-@torch.compile
-def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
-    """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
-    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
-    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
-    zero even beyond the point where the iteration no longer converges all the way to one everywhere
-    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
-    performance at all relative to UV^T, where USV^T = G is the SVD.
-    """
-    assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
-    a, b, c = (3.4445, -4.7750,  2.0315)
-    X = G.bfloat16()
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-
-    # Ensure spectral norm is at most 1
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-    # Perform the NS iterations
-    for _ in range(steps):
-        A = X @ X.mT
-        B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-        X = a * X + B @ X
-    
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-    return X
 
 class Nuon(torch.optim.Optimizer):
     """
@@ -208,7 +178,7 @@ class Nuon(torch.optim.Optimizer):
         ns_steps: The number of Newton-Schulz iteration steps to use.
         start_sparse_precond_updates: When to stop updating the preconditioner every step.
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, start_sparse_precond_updates=1000, rank=0, world_size=1):
+    def __init__(self, params, lr=0.001, momentum=0.9, nesterov=False, ns_steps=5, start_sparse_precond_updates=1000, rank=0, world_size=1):
         self.rank = rank
         self.world_size = world_size
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, start_sparse_precond_updates=start_sparse_precond_updates)
@@ -242,8 +212,8 @@ class Nuon(torch.optim.Optimizer):
                 assert handle is not None
                 handle.wait()
                 for p_world, g_world in zip(params_world, update_buffer_views):
-                    # update = g_world.view_as(p_world) * max(1, p_world.size(-2) / p_world.size(-1)) ** 0.5
-                    # print(f"update RMS for shape {p_world.shape}: {update.square().mean().sqrt()}")
+                    update = g_world.view_as(p_world)
+                    print(f"update RMS for shape {p_world.shape}: {update.square().mean().sqrt()}")
                     p_world.add_(g_world.view_as(p_world), alpha=-lr)
             for base_i in range(len(params))[::self.world_size]:
                 if base_i + self.rank < len(params):
@@ -257,8 +227,8 @@ class Nuon(torch.optim.Optimizer):
                     state["step"] += 1
                     step = state["step"]
                     buf: Tensor = state["momentum_buffer"]
-                    buf.lerp_(g, 1 - momentum)
-                    g = g.lerp_(buf, momentum) if nesterov else buf
+                    buf.mul_(momentum).add_(g, alpha=1-momentum)  # ema momentum
+                    g = buf.div(1 - momentum ** step)
                     orig_shape = g.shape
                     g: Tensor = g.view(orig_shape[0], -1)
                     if 'Q' not in state:
@@ -318,7 +288,7 @@ class Rotary(nn.Module):
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, layer_idx: int):
+    def __init__(self, dim: int, num_heads: int, layer_idx: int, num_layers: int):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
@@ -330,9 +300,9 @@ class CausalSelfAttention(nn.Module):
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(dim // num_heads) # dim // num_heads = head_dim
         self.c_proj = CastedLinear(dim, dim)
-        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
-        # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
-        # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
+        # Replace zero init with Wang init
+        std = 2.0 / (num_layers * dim**0.5)
+        nn.init.normal_(self.c_proj.weight, mean=0.0, std=std)
         self.attn_scale = 0.12
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
@@ -351,11 +321,13 @@ class CausalSelfAttention(nn.Module):
         return y
 
 class MLP(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim: int, num_layers: int):
         super().__init__()
         self.c_fc = CastedLinear(dim, 4 * dim)
         self.c_proj = CastedLinear(4 * dim, dim)
-        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        # Replace zero init with Wang init
+        std = 2.0 / (num_layers * dim**0.5)
+        nn.init.normal_(self.c_proj.weight, mean=0.0, std=std)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -364,11 +336,11 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, model_dim: int, num_heads: int, layer_idx: int):
+    def __init__(self, model_dim: int, num_heads: int, layer_idx: int, num_layers: int):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(model_dim, num_heads, layer_idx) if layer_idx != 7 else None
-        self.mlp = MLP(model_dim)
+        self.attn = CausalSelfAttention(model_dim, num_heads, layer_idx, num_layers) if layer_idx != 7 else None
+        self.mlp = MLP(model_dim, num_layers)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def forward(self, x, ve, x0, block_mask):
@@ -401,7 +373,7 @@ class GPT(nn.Module):
         self.embed = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         self.value_embeds = ValueEmbedding(vocab_size, model_dim)
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, layer_idx) for layer_idx in range(num_layers)])
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, layer_idx, num_layers) for layer_idx in range(num_layers)])
         # U-net design by @brendanh0gan
         self.num_encoder_layers = num_layers // 2 # Half of the layers for encoder
         self.num_decoder_layers = num_layers - self.num_encoder_layers # Remaining for decoder
@@ -410,7 +382,9 @@ class GPT(nn.Module):
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128))
-        self.lm_head.weight.detach().zero_() # @Grad62304977
+        # Replace zero init with Wang init
+        std = 2.0 / (num_layers * model_dim**0.5)
+        nn.init.normal_(self.lm_head.weight, mean=0.0, std=std)
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 128
@@ -526,10 +500,10 @@ class Hyperparameters:
     num_iterations = 7500 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # muon optimizer settings
-    muon_lr = 0.025
-    muon_momentum = 0.95
+    muon_lr = 0.001
+    muon_momentum = 0.9
     muon_ns_steps = 5
-    start_sparse_precond_updates = 2000
+    start_sparse_precond_updates = 1000
     # adam optimizer settings
     head_lr = 0.003
     embed_lr = 0.3

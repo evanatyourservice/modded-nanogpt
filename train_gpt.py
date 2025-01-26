@@ -108,7 +108,7 @@ def lm_head_fp8(x: Tensor, w: Tensor) -> Tensor:
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
-preconditioner_dtype = torch.float32  # probably could just do bf16 but i'm going to default
+PRECOND_DTYPE = torch.float32  # probably could just do bf16 but i'm going to default
 # to keeping buffer in f32, but doing much of the preconditioner update in bf16 anyway
 
 def _lb(A: Tensor, max_abs: Tensor):
@@ -131,13 +131,13 @@ def psgd_whitening_like_muon(G: Tensor, Q: Tensor):
         G = G.T
     
     # update preconditioner
-    V = torch.randn_like(G, dtype=torch.float32) / torch.sqrt(torch.tensor(G.size(0), dtype=torch.float32))
+    V = torch.randn_like(G, dtype=torch.float32)
     Bh = torch.linalg.solve_triangular(Q.float(), V, upper=True, left=False).bfloat16()  # roughly same complexity as a matmul
     BBh = Bh.T @ Bh
     A = G @ Q.T.bfloat16()
     AhA = A.T @ A
-    lr = torch.tensor(0.3, dtype=preconditioner_dtype)
-    Q = Q - lr / norm_lower_bound(AhA + BBh) * torch.triu(AhA.to(preconditioner_dtype) - BBh.to(preconditioner_dtype)) @ Q
+    lr = torch.tensor(0.3, dtype=PRECOND_DTYPE)
+    Q = Q - lr / norm_lower_bound(AhA + BBh).to(PRECOND_DTYPE) * torch.triu(AhA.to(PRECOND_DTYPE) - BBh.to(PRECOND_DTYPE)) @ Q
 
     # precondition grads
     Q_in = Q.bfloat16()
@@ -146,7 +146,7 @@ def psgd_whitening_like_muon(G: Tensor, Q: Tensor):
     if m < n:
         G = G.T
     assert G.dtype == torch.bfloat16
-    assert Q.dtype == preconditioner_dtype, "something went wrong, Q is no longer in preconditioner_dtype"
+    assert Q.dtype == PRECOND_DTYPE, "something went wrong, Q is no longer in preconditioner_dtype"
     return G, Q
 
 @torch.compile
@@ -192,7 +192,7 @@ class Nuon(torch.optim.Optimizer):
                  start_sparse_precond_updates=1000, weight_decay=0.0, rank=0, world_size=1):
         self.rank = rank
         self.world_size = world_size
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, 
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps,
                        start_sparse_precond_updates=start_sparse_precond_updates,
                        weight_decay=weight_decay)
         params: list[Tensor] = [*params]
@@ -226,9 +226,10 @@ class Nuon(torch.optim.Optimizer):
                 assert handle is not None
                 handle.wait()
                 for p_world, g_world in zip(params_world, update_buffer_views):
+                    grads = g_world.view_as(p_world)
                     if weight_decay > 0:
-                        g_world.add_(p_world, alpha=weight_decay)
-                    p_world.add_(g_world, alpha=-lr)
+                        grads.add_(p_world, alpha=weight_decay)
+                    p_world.add_(grads, alpha=-lr)
             for base_i in range(len(params))[::self.world_size]:
                 if base_i + self.rank < len(params):
                     p = params[base_i + self.rank]
@@ -244,11 +245,11 @@ class Nuon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g, alpha=1-momentum)  # ema momentum
                     g = buf.div(1 - momentum ** step)
                     orig_shape = g.shape
-                    g: Tensor = g.view(orig_shape[0], -1)
+                    g: Tensor = g.view(-1, orig_shape[-1])
                     if 'Q' not in state:
-                        state['Q'] = torch.eye(min(g.shape), dtype=preconditioner_dtype, device=g.device)
+                        state['Q'] = torch.eye(min(g.shape), dtype=PRECOND_DTYPE, device=g.device)
                     # we don't have to update precond every step once loss is stable
-                    if step < start_sparse_precond_updates or (step >= start_sparse_precond_updates and step % 8 == 0):
+                    if step < start_sparse_precond_updates or (step >= start_sparse_precond_updates and step % 5 == 0):
                         # update preconditioner and precondition grads
                         g, Q = psgd_whitening_like_muon(g, state['Q'])
                         state['Q'] = Q
@@ -256,8 +257,9 @@ class Nuon(torch.optim.Optimizer):
                         # precondition grads
                         g = psgd_precondition_grads(g, state['Q'])
                     rms = g.square().mean().sqrt()
-                    print(f"RMS for shape {g.shape}: {rms}")
-                    if rms > 1.1:  # clip at RMS 1.1
+                    if step % 250 == 0:
+                        print(f"RMS for shape {g.shape}: {rms}")
+                    if rms > 1.1:  # can clip at RMS 1.1
                         g *= 1.1 / rms
                     g = g.view(orig_shape).contiguous()
                 else:
@@ -272,6 +274,8 @@ class Nuon(torch.optim.Optimizer):
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
+
+USE_WANG_INIT = False  # trying tiny init in place of zero init
 
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int):
@@ -318,9 +322,11 @@ class CausalSelfAttention(nn.Module):
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(dim // num_heads) # dim // num_heads = head_dim
         self.c_proj = CastedLinear(dim, dim)
-        # Replace zero init with Wang init
-        std = 2.0 / (num_layers * dim**0.5)
-        nn.init.normal_(self.c_proj.weight, mean=0.0, std=std)
+        if USE_WANG_INIT:
+            std = 2.0 / (num_layers * dim**0.5)
+            nn.init.normal_(self.c_proj.weight, mean=0.0, std=std)
+        else:
+            self.c_proj.weight.detach().zero_()
         self.attn_scale = 0.12
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
@@ -343,9 +349,11 @@ class MLP(nn.Module):
         super().__init__()
         self.c_fc = CastedLinear(dim, 4 * dim)
         self.c_proj = CastedLinear(4 * dim, dim)
-        # Replace zero init with Wang init
-        std = 2.0 / (num_layers * dim**0.5)
-        nn.init.normal_(self.c_proj.weight, mean=0.0, std=std)
+        if USE_WANG_INIT:
+            std = 2.0 / (num_layers * dim**0.5)
+            nn.init.normal_(self.c_proj.weight, mean=0.0, std=std)
+        else:
+            self.c_proj.weight.detach().zero_()
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -400,9 +408,11 @@ class GPT(nn.Module):
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128))
-        # Replace zero init with Wang init
-        std = 2.0 / (num_layers * model_dim**0.5)
-        nn.init.normal_(self.lm_head.weight, mean=0.0, std=std)
+        if USE_WANG_INIT:
+            std = 2.0 / (num_layers * model_dim**0.5)
+            nn.init.normal_(self.lm_head.weight, mean=0.0, std=std)
+        else:
+            self.lm_head.weight.detach().zero_()
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 128
@@ -518,11 +528,11 @@ class Hyperparameters:
     num_iterations = 7500 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # muon optimizer settings
-    muon_lr = 0.001
+    muon_lr = 0.0005
     muon_momentum = 0.9
     muon_ns_steps = 5
-    muon_weight_decay = 0.01
-    start_sparse_precond_updates = 1000
+    muon_weight_decay = 0.1
+    start_sparse_precond_updates = 2000
     # adam optimizer settings
     head_lr = 0.003
     embed_lr = 0.3
@@ -621,23 +631,6 @@ hidden_matrix_params = [p for p in model.blocks.parameters() if p.ndim >= 2]
 embed_params = [model.embed.weight, *model.value_embeds.parameters()]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
-
-# print parameter shapes
-if master_process:
-    print0("\nParameter shapes:", console=True)
-    print0("\nHidden matrix params:", console=True)
-    for p in hidden_matrix_params:
-        print0(f"  {tuple(p.shape)}", console=True)
-    print0("\nEmbedding params:", console=True)
-    for p in embed_params:
-        print0(f"  {tuple(p.shape)}", console=True)
-    print0("\nScalar params:", console=True)
-    for p in scalar_params:
-        print0(f"  {tuple(p.shape)}", console=True)
-    print0("\nHead params:", console=True)
-    for p in head_params:
-        print0(f"  {tuple(p.shape)}", console=True)
-    print0("\n", console=True)
 
 # init the optimizer(s)
 adam_params = [dict(params=head_params, lr=args.head_lr), dict(params=embed_params, lr=args.embed_lr), dict(params=scalar_params, lr=args.scalar_lr)]

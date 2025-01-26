@@ -18,6 +18,7 @@ import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
+torch.set_float32_matmul_precision('high')
 
 # -----------------------------------------------------------------------------
 # Custom operators : FP8 matmul for lm_head by @YouJiacheng
@@ -108,8 +109,8 @@ def lm_head_fp8(x: Tensor, w: Tensor) -> Tensor:
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
-PRECOND_DTYPE = torch.float32  # probably could just do bf16 but i'm going to default
-# to keeping buffer in f32 with doing much of the preconditioner update in bf16 anyway
+PRECOND_DTYPE = torch.float32  # probably could just do bf16, defaulting to f32 but
+# doing most of precond update in bf16 anyway
 
 def _lb(A: Tensor, max_abs: Tensor):
     A = A / max_abs

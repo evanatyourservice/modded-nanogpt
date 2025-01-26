@@ -123,7 +123,7 @@ def norm_lower_bound(A: Tensor):
 def psgd_whitening_like_muon(G: Tensor, Q: Tensor):
     G = G.bfloat16()
     assert Q.dtype == torch.bfloat16, "please keep Q in bfloat16"
-    lr = torch.tensor(0.5, dtype=torch.bfloat16)
+    lr = torch.tensor(0.3, dtype=torch.bfloat16)
     m, n = G.shape
     if m < n:
         G = G.T
@@ -206,7 +206,7 @@ class Nuon(torch.optim.Optimizer):
         momentum: The momentum used by the internal SGD.
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         ns_steps: The number of Newton-Schulz iteration steps to use.
-        start_sparse_precond_updates: When to start updating the preconditioner only every 10 steps instead of every step.
+        start_sparse_precond_updates: When to stop updating the preconditioner every step.
     """
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, start_sparse_precond_updates=1000, rank=0, world_size=1):
         self.rank = rank
@@ -264,7 +264,7 @@ class Nuon(torch.optim.Optimizer):
                     if 'Q' not in state:
                         state['Q'] = torch.eye(min(g.shape), dtype=torch.bfloat16, device=g.device)
                     # we don't have to update precond every step once loss is stable
-                    if step < start_sparse_precond_updates or (step >= start_sparse_precond_updates and step % 10 == 0):
+                    if step < start_sparse_precond_updates or (step >= start_sparse_precond_updates and step % 5 == 0):
                         # update preconditioner and precondition grads
                         g, Q = psgd_whitening_like_muon(g, state['Q'])
                         state['Q'] = Q

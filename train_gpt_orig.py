@@ -453,8 +453,6 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
 # -----------------------------------------------------------------------------
 # int main
 
-multiplier = 8  # useful for when there are less than 8 GPUs
-
 @dataclass
 class Hyperparameters:
     # data
@@ -462,7 +460,7 @@ class Hyperparameters:
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # optimization
-    batch_size = 8*64*1024 * multiplier # batch size in tokens
+    batch_size = 8*64*1024 # batch size in tokens
     num_iterations = 7500 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # muon optimizer settings
@@ -480,7 +478,7 @@ class Hyperparameters:
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     wandb_project = "nanogpt"
     # implementation
-    seq_len = 64*1024 // multiplier # FlexAttention sequence length
+    seq_len = 64*1024 # FlexAttention sequence length
     save_checkpoint = False
 args = Hyperparameters()
 
@@ -625,7 +623,10 @@ for step in range(train_steps + 1):
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms", console=True)
         if master_process:
-            wandb.log({"val_loss": val_loss.item(), "step": step, "train_time_ms": training_time_ms, "step_time_ms": training_time_ms/(timed_steps-1)})
+            to_log = {"val_loss": val_loss.item(), "step": step, "train_time_ms": training_time_ms}
+            if timed_steps > 1:
+                to_log["step_time_ms"] = training_time_ms/(timed_steps-1)
+            wandb.log(to_log)
         model.train()
         # start the clock again
         torch.cuda.synchronize()

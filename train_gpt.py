@@ -142,8 +142,6 @@ def psgd_whitening_like_muon(G: Tensor, Q: Tensor):
 
     if m < n:
         G = G.T
-    assert G.dtype == torch.bfloat16
-    assert Q.dtype == torch.bfloat16
     return G, Q
 
 @torch.compile
@@ -155,7 +153,6 @@ def psgd_precondition_grads(G: Tensor, Q: Tensor):
         G = torch.einsum('ji,jk,kl->il', Q, Q, G)
     else:
         G = torch.einsum('ij,kj,kl->il', G, Q, Q)
-    assert G.dtype == torch.bfloat16
     return G
 
 class Nuon(torch.optim.Optimizer):
@@ -246,15 +243,13 @@ class Nuon(torch.optim.Optimizer):
                     if 'Q' not in state:
                         state['Q'] = torch.eye(min(g.shape), dtype=torch.bfloat16, device=g.device)
                     # we don't have to update precond every step once loss is stable
-                    if step < start_sparse_precond_updates or (step >= start_sparse_precond_updates and step % 5 == 0):
+                    if step < start_sparse_precond_updates or (step >= start_sparse_precond_updates and step % 4 == 0):
                         # update preconditioner and precondition grads
                         g, Q = psgd_whitening_like_muon(g, state['Q'])
                         state['Q'] = Q
                     else:
                         # precondition grads
                         g = psgd_precondition_grads(g, state['Q'])
-                    assert state['Q'].dtype == torch.bfloat16
-                    assert g.dtype == torch.bfloat16
                     rms = g.square().mean().sqrt()
                     if step % 250 == 0:
                         print(f"RMS for shape {g.shape}: {rms}")
@@ -274,7 +269,7 @@ class Nuon(torch.optim.Optimizer):
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
-USE_WANG_INIT = True  # trying tiny init in place of zero init
+USE_WANG_INIT = True
 
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int):
@@ -527,10 +522,10 @@ class Hyperparameters:
     num_iterations = 7500 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # muon optimizer settings
-    muon_lr = 0.0005
+    muon_lr = 0.001
     muon_momentum = 0.9
     muon_ns_steps = 5
-    muon_weight_decay = 0.01
+    muon_weight_decay = 0.1
     start_sparse_precond_updates = 2000
     # adam optimizer settings
     head_lr = 0.003

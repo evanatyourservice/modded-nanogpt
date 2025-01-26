@@ -145,10 +145,9 @@ def psgd_precondition_grads(G: Tensor, Q: Tensor):
     assert Q.dtype == torch.bfloat16, "please keep Q in bfloat16"
     m, n = G.shape
     if m < n:
-        G = G.T
-    G = G @ Q.T @ Q
-    if m < n:
-        G = G.T
+        G = Q.T @ Q @ G
+    else:
+        G = G @ Q.T @ Q
     return G
 
 class Nuon(torch.optim.Optimizer):
@@ -212,8 +211,6 @@ class Nuon(torch.optim.Optimizer):
                 assert handle is not None
                 handle.wait()
                 for p_world, g_world in zip(params_world, update_buffer_views):
-                    update = g_world.view_as(p_world)
-                    print(f"update RMS for shape {p_world.shape}: {update.square().mean().sqrt()}")
                     p_world.add_(g_world.view_as(p_world), alpha=-lr)
             for base_i in range(len(params))[::self.world_size]:
                 if base_i + self.rank < len(params):
@@ -241,6 +238,10 @@ class Nuon(torch.optim.Optimizer):
                     else:
                         # precondition grads
                         g = psgd_precondition_grads(g, state['Q'])
+                    rms = g.square().mean().sqrt()
+                    print(f"RMS for shape {g.shape}: {rms}")
+                    if rms > 1.1:  # clip at RMS 1.1
+                        g *= 1.1 / rms
                     g = g.view(orig_shape).contiguous()
                 else:
                     g = update_buffer_views[self.rank]
@@ -602,6 +603,23 @@ embed_params = [model.embed.weight, *model.value_embeds.parameters()]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 
+# print parameter shapes
+if master_process:
+    print0("\nParameter shapes:", console=True)
+    print0("\nHidden matrix params:", console=True)
+    for p in hidden_matrix_params:
+        print0(f"  {tuple(p.shape)}", console=True)
+    print0("\nEmbedding params:", console=True)
+    for p in embed_params:
+        print0(f"  {tuple(p.shape)}", console=True)
+    print0("\nScalar params:", console=True)
+    for p in scalar_params:
+        print0(f"  {tuple(p.shape)}", console=True)
+    print0("\nHead params:", console=True)
+    for p in head_params:
+        print0(f"  {tuple(p.shape)}", console=True)
+    print0("\n", console=True)
+
 # init the optimizer(s)
 adam_params = [dict(params=head_params, lr=args.head_lr), dict(params=embed_params, lr=args.embed_lr), dict(params=scalar_params, lr=args.scalar_lr)]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
@@ -688,7 +706,7 @@ for step in range(train_steps + 1):
     # momentum warmup for Muon
     # frac = min(step / 300, 1)
     # for group in optimizer2.param_groups:
-    #     group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+    #     group["momentum"] = (1 - frac) * 0.85 + frac * args.muon_momentum
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()

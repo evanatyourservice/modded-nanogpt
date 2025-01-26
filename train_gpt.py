@@ -108,6 +108,9 @@ def lm_head_fp8(x: Tensor, w: Tensor) -> Tensor:
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
+preconditioner_dtype = torch.float32  # probably could just do bf16 but i'm going to default
+# to keeping buffer in f32, but doing much of the preconditioner update in bf16 anyway
+
 def _lb(A: Tensor, max_abs: Tensor):
     A = A / max_abs
     x = A[:, torch.max(torch.sum(A * A, dim=0), 0)[1]] @ A
@@ -116,38 +119,46 @@ def _lb(A: Tensor, max_abs: Tensor):
 @torch.compiler.disable
 def norm_lower_bound(A: Tensor):
     """Cheap lower bound for the spectral norm of A."""
+    A = A.float()
     max_abs = A.norm(float("inf"))
     return torch.where(max_abs > 0, _lb(A, max_abs), max_abs)
 
 @torch.compile
 def psgd_whitening_like_muon(G: Tensor, Q: Tensor):
     G = G.bfloat16()
-    assert Q.dtype == torch.bfloat16, "please keep Q in bfloat16"
-    lr = torch.tensor(0.3, dtype=torch.bfloat16)
     m, n = G.shape
     if m < n:
         G = G.T
-    V = torch.randn_like(G) / torch.sqrt(torch.tensor(G.size(0), dtype=torch.bfloat16))
-    A = G @ Q.T
-    Bh = torch.linalg.solve_triangular(Q.float(), V.float(), upper=True, left=False).bfloat16()  # roughly same complexity as a matmul
-    AhA = A.T @ A
+    
+    # update preconditioner
+    V = torch.randn_like(G, dtype=torch.float32) / torch.sqrt(torch.tensor(G.size(0), dtype=torch.float32))
+    Bh = torch.linalg.solve_triangular(Q.float(), V, upper=True, left=False).bfloat16()  # roughly same complexity as a matmul
     BBh = Bh.T @ Bh
-    Q = Q - lr / norm_lower_bound(AhA + BBh) * torch.triu(AhA - BBh) @ Q
-    G = G @ Q.T @ Q
+    A = G @ Q.T.bfloat16()
+    AhA = A.T @ A
+    lr = torch.tensor(0.3, dtype=preconditioner_dtype)
+    Q = Q - lr / norm_lower_bound(AhA + BBh) * torch.triu(AhA.to(preconditioner_dtype) - BBh.to(preconditioner_dtype)) @ Q
+
+    # precondition grads
+    Q_in = Q.bfloat16()
+    G = torch.einsum('ij,kj,kl->il', G, Q_in, Q_in)
+
     if m < n:
         G = G.T
-    assert Q.dtype == torch.bfloat16, "something went wrong, Q is no longer in bfloat16"
+    assert G.dtype == torch.bfloat16
+    assert Q.dtype == preconditioner_dtype, "something went wrong, Q is no longer in preconditioner_dtype"
     return G, Q
 
 @torch.compile
 def psgd_precondition_grads(G: Tensor, Q: Tensor):
     G = G.bfloat16()
-    assert Q.dtype == torch.bfloat16, "please keep Q in bfloat16"
+    Q = Q.bfloat16()
     m, n = G.shape
     if m < n:
-        G = Q.T @ Q @ G
+        G = torch.einsum('ji,jk,kl->il', Q, Q, G)
     else:
-        G = G @ Q.T @ Q
+        G = torch.einsum('ij,kj,kl->il', G, Q, Q)
+    assert G.dtype == torch.bfloat16
     return G
 
 class Nuon(torch.optim.Optimizer):
@@ -177,10 +188,13 @@ class Nuon(torch.optim.Optimizer):
         ns_steps: The number of Newton-Schulz iteration steps to use.
         start_sparse_precond_updates: When to stop updating the preconditioner every step.
     """
-    def __init__(self, params, lr=0.001, momentum=0.9, nesterov=False, ns_steps=5, start_sparse_precond_updates=1000, rank=0, world_size=1):
+    def __init__(self, params, lr=0.001, momentum=0.9, nesterov=False, ns_steps=5, 
+                 start_sparse_precond_updates=1000, weight_decay=0.0, rank=0, world_size=1):
         self.rank = rank
         self.world_size = world_size
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, start_sparse_precond_updates=start_sparse_precond_updates)
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, 
+                       start_sparse_precond_updates=start_sparse_precond_updates,
+                       weight_decay=weight_decay)
         params: list[Tensor] = [*params]
         assert all(isinstance(p, Tensor) for p in params)
         sizes = {p.numel() for p in params}
@@ -199,6 +213,7 @@ class Nuon(torch.optim.Optimizer):
             nesterov = group["nesterov"]
             ns_steps = group["ns_steps"]
             start_sparse_precond_updates = group["start_sparse_precond_updates"]
+            weight_decay = group["weight_decay"]
             update_buffer = group["update_buffer"]
             update_buffer_views: list[Tensor] = group["update_buffer_views"]
             # generate weight updates in distributed fashion
@@ -211,7 +226,9 @@ class Nuon(torch.optim.Optimizer):
                 assert handle is not None
                 handle.wait()
                 for p_world, g_world in zip(params_world, update_buffer_views):
-                    p_world.add_(g_world.view_as(p_world), alpha=-lr)
+                    if weight_decay > 0:
+                        g_world.add_(p_world, alpha=weight_decay)
+                    p_world.add_(g_world, alpha=-lr)
             for base_i in range(len(params))[::self.world_size]:
                 if base_i + self.rank < len(params):
                     p = params[base_i + self.rank]
@@ -229,9 +246,9 @@ class Nuon(torch.optim.Optimizer):
                     orig_shape = g.shape
                     g: Tensor = g.view(orig_shape[0], -1)
                     if 'Q' not in state:
-                        state['Q'] = torch.eye(min(g.shape), dtype=torch.bfloat16, device=g.device)
+                        state['Q'] = torch.eye(min(g.shape), dtype=preconditioner_dtype, device=g.device)
                     # we don't have to update precond every step once loss is stable
-                    if step < start_sparse_precond_updates or (step >= start_sparse_precond_updates and step % 5 == 0):
+                    if step < start_sparse_precond_updates or (step >= start_sparse_precond_updates and step % 8 == 0):
                         # update preconditioner and precondition grads
                         g, Q = psgd_whitening_like_muon(g, state['Q'])
                         state['Q'] = Q
@@ -504,6 +521,7 @@ class Hyperparameters:
     muon_lr = 0.001
     muon_momentum = 0.9
     muon_ns_steps = 5
+    muon_weight_decay = 0.01
     start_sparse_precond_updates = 1000
     # adam optimizer settings
     head_lr = 0.003
@@ -556,6 +574,7 @@ if master_process:
             "muon_lr": args.muon_lr,
             "muon_momentum": args.muon_momentum,
             "muon_ns_steps": args.muon_ns_steps,
+            "muon_weight_decay": args.muon_weight_decay,
             "start_sparse_precond_updates": args.start_sparse_precond_updates,
             # adam optimizer
             "head_lr": args.head_lr,
@@ -625,8 +644,10 @@ adam_params = [dict(params=head_params, lr=args.head_lr), dict(params=embed_para
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = torch.optim.Adam(adam_params, betas=(args.adam_beta1, args.adam_beta2), fused=True, eps=args.adam_eps)
-optimizer2 = Nuon(hidden_matrix_params, lr=args.muon_lr, momentum=args.muon_momentum, ns_steps=args.muon_ns_steps,
-                  start_sparse_precond_updates=args.start_sparse_precond_updates, rank=rank, world_size=world_size)
+optimizer2 = Nuon(hidden_matrix_params, lr=args.muon_lr, momentum=args.muon_momentum, 
+                  ns_steps=args.muon_ns_steps, weight_decay=args.muon_weight_decay,
+                  start_sparse_precond_updates=args.start_sparse_precond_updates, 
+                  rank=rank, world_size=world_size)
 optimizers = [optimizer1, optimizer2]
 
 # learning rate schedule: stable then decay

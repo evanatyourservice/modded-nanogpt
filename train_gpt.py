@@ -122,12 +122,9 @@ def norm_lower_bound(A: Tensor):
 
 @torch.compile
 def psgd_whitening_like_muon(G: Tensor, Q: Tensor):
-    G = G.bfloat16()
     m, n = G.shape
     if m < n:
         G = G.T
-    
-    # update preconditioner
     V = torch.randn_like(G, dtype=torch.float32)
     Bh = torch.linalg.solve_triangular(Q.float(), V, upper=True, left=False).bfloat16()  # roughly same complexity as a matmul
     BBh = Bh.T @ Bh
@@ -135,25 +132,15 @@ def psgd_whitening_like_muon(G: Tensor, Q: Tensor):
     AhA = A.T @ A
     lr = torch.tensor(0.3, dtype=torch.bfloat16)
     Q = Q - lr / norm_lower_bound(AhA + BBh) * torch.triu(AhA - BBh) @ Q
-
-    # precondition grads in bf16
-    Q_in = Q.bfloat16()
-    G = torch.einsum('ij,kj,kl->il', G, Q_in, Q_in)
-
-    if m < n:
-        G = G.T
-    return G, Q
+    return Q
 
 @torch.compile
 def psgd_precondition_grads(G: Tensor, Q: Tensor):
-    G = G.bfloat16()
-    Q = Q.bfloat16()
     m, n = G.shape
     if m < n:
-        G = torch.einsum('ji,jk,kl->il', Q, Q, G)
+        return torch.einsum('ji,jk,kl->il', Q, Q, G)
     else:
-        G = torch.einsum('ij,kj,kl->il', G, Q, Q)
-    return G
+        return torch.einsum('ij,kj,kl->il', G, Q, Q)
 
 class Nuon(torch.optim.Optimizer):
     """
@@ -181,15 +168,14 @@ class Nuon(torch.optim.Optimizer):
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         ns_steps: The number of Newton-Schulz iteration steps to use.
         start_sparse_precond_updates: When to stop updating the preconditioner every step.
-        graft_adam: Whether to graft adam's lr onto update.
     """
     def __init__(self, params, lr=0.0003, momentum=0.9, nesterov=False, ns_steps=5, 
-                 start_sparse_precond_updates=1000, weight_decay=0.0, graft_adam=False, rank=0, world_size=1):
+                 start_sparse_precond_updates=1000, weight_decay=0.0, rank=0, world_size=1):
         self.rank = rank
         self.world_size = world_size
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps,
                        start_sparse_precond_updates=start_sparse_precond_updates,
-                       weight_decay=weight_decay, graft_adam=graft_adam)
+                       weight_decay=weight_decay)
         params: list[Tensor] = [*params]
         assert all(isinstance(p, Tensor) for p in params)
         sizes = {p.numel() for p in params}
@@ -209,7 +195,6 @@ class Nuon(torch.optim.Optimizer):
             ns_steps = group["ns_steps"]
             start_sparse_precond_updates = group["start_sparse_precond_updates"]
             weight_decay = group["weight_decay"]
-            graft_adam = group["graft_adam"]
             update_buffer = group["update_buffer"]
             update_buffer_views: list[Tensor] = group["update_buffer_views"]
             # generate weight updates in distributed fashion
@@ -234,38 +219,27 @@ class Nuon(torch.optim.Optimizer):
                     state = self.state[p]
                     if "momentum_buffer" not in state:
                         state["momentum_buffer"] = torch.zeros_like(g)
-                        if graft_adam:
-                            state["nu"] = torch.zeros_like(g)
                         state["step"] = 0
                     state["step"] += 1
                     step = state["step"]
                     buf: Tensor = state["momentum_buffer"]
                     buf.mul_(momentum).add_(g, alpha=1-momentum)  # ema momentum
                     g = buf.div(1 - momentum ** step)
-                    if graft_adam:
-                        nu: Tensor = state["nu"]
-                        nu.mul_(0.95).add_(g ** 2, alpha=0.05)
-                        adam_norm = torch.linalg.norm(g / (nu.div(1 - 0.95 ** step).sqrt() + 1e-8))
                     orig_shape = g.shape
                     g: Tensor = g.view(-1, orig_shape[-1])
                     if 'Q' not in state:
                         state['Q'] = torch.eye(min(g.shape), dtype=torch.bfloat16, device=g.device)
+                    g = g.bfloat16()
                     # we don't have to update precond every step once loss is stable
-                    if step < start_sparse_precond_updates or (step >= start_sparse_precond_updates and step % 4 == 0):
+                    # if step < start_sparse_precond_updates or (step >= start_sparse_precond_updates and step % 5 == 0):
                         # update preconditioner and precondition grads
-                        g, Q = psgd_whitening_like_muon(g, state['Q'])
-                        state['Q'] = Q
-                    else:
-                        # precondition grads
-                        g = psgd_precondition_grads(g, state['Q'])
-                    if graft_adam:
-                        g *= adam_norm / torch.linalg.norm(g)
-                    else:
-                        rms = g.square().mean().sqrt()
-                        if step % 250 == 0:
-                            print(f"RMS for shape {g.shape}: {rms}")
-                        if rms > 1.1:  # can clip at RMS 1.1
-                            g *= 1.1 / rms
+                    state['Q'] = psgd_whitening_like_muon(g, state['Q'])
+                    g = psgd_precondition_grads(g, state['Q'])
+                    rms = g.square().mean().sqrt()
+                    # if step % 250 == 0:
+                    #     print(f"RMS for shape {g.shape}: {rms}")
+                    if rms > 1.1:  # can clip at RMS 1.1
+                        g *= 1.1 / rms
                     g = g.view(orig_shape).contiguous()
                 else:
                     g = update_buffer_views[self.rank]
@@ -533,12 +507,11 @@ class Hyperparameters:
     num_iterations = 7500 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # muon optimizer settings
-    muon_lr = 0.001
+    muon_lr = 0.0006
     muon_momentum = 0.9
     muon_ns_steps = 5
     muon_weight_decay = 0.1
-    start_sparse_precond_updates = 2000
-    graft_adam = True
+    start_sparse_precond_updates = 1000
     # adam optimizer settings
     head_lr = 0.003
     embed_lr = 0.3
@@ -592,7 +565,6 @@ if master_process:
             "muon_ns_steps": args.muon_ns_steps,
             "muon_weight_decay": args.muon_weight_decay,
             "start_sparse_precond_updates": args.start_sparse_precond_updates,
-            "graft_adam": args.graft_adam,
             # adam optimizer
             "head_lr": args.head_lr,
             "embed_lr": args.embed_lr,
@@ -647,7 +619,6 @@ optimizer1 = torch.optim.Adam(adam_params, betas=(args.adam_beta1, args.adam_bet
 optimizer2 = Nuon(hidden_matrix_params, lr=args.muon_lr, momentum=args.muon_momentum, 
                   ns_steps=args.muon_ns_steps, weight_decay=args.muon_weight_decay,
                   start_sparse_precond_updates=args.start_sparse_precond_updates, 
-                  graft_adam=args.graft_adam,
                   rank=rank, world_size=world_size)
 optimizers = [optimizer1, optimizer2]
 
@@ -737,7 +708,7 @@ for step in range(train_steps + 1):
     # null the gradients
     model.zero_grad(set_to_none=True)
     # logging
-    if step % 10 == 0:
+    if step % 10 == 0 and master_process:
         wandb.log({"loss": loss.item()}, step=step)
     approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms loss:{loss:.4f}", console=True)

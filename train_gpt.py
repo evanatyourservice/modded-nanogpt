@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 import wandb
+from kron import Kron, precond_update_prob_schedule
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -507,11 +508,12 @@ class Hyperparameters:
     num_iterations = 7500 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # muon optimizer settings
-    muon_lr = 0.0006
+    muon_lr = 0.0005
     muon_momentum = 0.9
     muon_ns_steps = 5
     muon_weight_decay = 0.1
-    start_sparse_precond_updates = 1000
+    precond_lr = 0.4
+    precond_init_scale = 0.1
     # adam optimizer settings
     head_lr = 0.003
     embed_lr = 0.3
@@ -564,7 +566,8 @@ if master_process:
             "muon_momentum": args.muon_momentum,
             "muon_ns_steps": args.muon_ns_steps,
             "muon_weight_decay": args.muon_weight_decay,
-            "start_sparse_precond_updates": args.start_sparse_precond_updates,
+            "precond_lr": args.precond_lr,
+            "precond_init_scale": args.precond_init_scale,
             # adam optimizer
             "head_lr": args.head_lr,
             "embed_lr": args.embed_lr,
@@ -612,15 +615,25 @@ scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 
 # init the optimizer(s)
-adam_params = [dict(params=head_params, lr=args.head_lr), dict(params=embed_params, lr=args.embed_lr), dict(params=scalar_params, lr=args.scalar_lr)]
+# adam_params = [dict(params=head_params, lr=args.head_lr), dict(params=embed_params, lr=args.embed_lr), dict(params=scalar_params, lr=args.scalar_lr)]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-optimizer1 = torch.optim.Adam(adam_params, betas=(args.adam_beta1, args.adam_beta2), fused=True, eps=args.adam_eps)
-optimizer2 = Nuon(hidden_matrix_params, lr=args.muon_lr, momentum=args.muon_momentum, 
-                  ns_steps=args.muon_ns_steps, weight_decay=args.muon_weight_decay,
-                  start_sparse_precond_updates=args.start_sparse_precond_updates, 
-                  rank=rank, world_size=world_size)
-optimizers = [optimizer1, optimizer2]
+# optimizer1 = torch.optim.Adam(adam_params, betas=(args.adam_beta1, args.adam_beta2), fused=True, eps=args.adam_eps)
+optimizer2 = Kron(
+    model.parameters(),
+    lr=args.muon_lr,
+    b1=args.muon_momentum,
+    weight_decay=args.muon_weight_decay,
+    preconditioner_update_probability=precond_update_prob_schedule(),
+    momentum_into_precond_update=True,
+    mu_dtype=torch.bfloat16,
+    precond_dtype=None,
+    precond_lr=args.precond_lr,
+    precond_init_scale=args.precond_init_scale,
+    rank=rank,
+    world_size=world_size
+)
+optimizers = [optimizer2]
 
 # learning rate schedule: stable then decay
 def get_lr(it: int):

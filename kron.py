@@ -181,6 +181,8 @@ class Kron(torch.optim.Optimizer):
                     momentum_buffer = state["momentum_buffer"]
                     beta = self.defaults["b1"]
                     momentum_buffer.mul_(beta).add_(p.grad, alpha=1 - beta)
+                    # keep buffer in bfloat16
+                    momentum_buffer.copy_(momentum_buffer.to(dtype=torch.bfloat16))
                     debiased_momentum = momentum_buffer.div(1 - beta ** state["step"])
 
                     if p.grad.dim() > 1 and balance:
@@ -190,17 +192,21 @@ class Kron(torch.optim.Optimizer):
                         _update_precond(
                             state["Q"],
                             state["exprs"],
-                            debiased_momentum if self.defaults["momentum_into_precond_update"] else p.grad,
+                            debiased_momentum if self.defaults["momentum_into_precond_update"] else p.grad.to(dtype=torch.bfloat16),
                             self.defaults["precond_lr"],
                             self._tiny,
                         )
 
                     g = _precond_grad(state["Q"], state["exprs"], debiased_momentum)
-                    norm = g.square().mean().sqrt().add_(1e-6)
-                    g.mul_(torch.minimum(torch.tensor(1.0), 1.1 / norm))
+                    g.mul_(torch.minimum(torch.tensor(1.0), 1.1 / g.square().mean().sqrt().add(1e-6)))
 
                     if self.defaults["weight_decay"] > 0 and p.dim() >= 2:
                         g.add_(p, alpha=self.defaults["weight_decay"])
+                    
+                    assert state["momentum_buffer"].dtype == torch.bfloat16
+                    assert debiased_momentum.dtype == torch.bfloat16
+                    assert g.dtype == torch.bfloat16
+                    assert state["Q"][0].dtype == torch.bfloat16
 
                     g = g.flatten()
                 else:

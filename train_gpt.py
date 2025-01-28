@@ -512,8 +512,9 @@ class Hyperparameters:
     muon_momentum = 0.9
     muon_ns_steps = 5
     muon_weight_decay = 0.1
-    memory_save_mode = "all_diag"
-    precond_lr = 0.3
+    max_size_triangular = 2000
+    memory_save_mode = None
+    precond_lr = 0.1
     precond_init_scale = 0.1
     # adam optimizer settings
     head_lr = 0.003
@@ -567,6 +568,7 @@ if master_process:
             "muon_momentum": args.muon_momentum,
             "muon_ns_steps": args.muon_ns_steps,
             "muon_weight_decay": args.muon_weight_decay,
+            "max_size_triangular": args.max_size_triangular,
             "memory_save_mode": args.memory_save_mode,
             "precond_lr": args.precond_lr,
             "precond_init_scale": args.precond_init_scale,
@@ -627,7 +629,7 @@ optimizer2 = Kron(
     b1=args.muon_momentum,
     weight_decay=args.muon_weight_decay,
     preconditioner_update_probability=precond_update_prob_schedule(),
-    max_size_triangular=8192,
+    max_size_triangular=args.max_size_triangular,
     memory_save_mode=args.memory_save_mode,
     momentum_into_precond_update=True,
     precond_lr=args.precond_lr,

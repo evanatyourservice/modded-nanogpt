@@ -512,7 +512,8 @@ class Hyperparameters:
     muon_momentum = 0.9
     muon_ns_steps = 5
     muon_weight_decay = 0.1
-    precond_lr = 0.4
+    memory_save_mode = "all_diag"
+    precond_lr = 0.3
     precond_init_scale = 0.1
     # adam optimizer settings
     head_lr = 0.003
@@ -566,6 +567,7 @@ if master_process:
             "muon_momentum": args.muon_momentum,
             "muon_ns_steps": args.muon_ns_steps,
             "muon_weight_decay": args.muon_weight_decay,
+            "memory_save_mode": args.memory_save_mode,
             "precond_lr": args.precond_lr,
             "precond_init_scale": args.precond_init_scale,
             # adam optimizer
@@ -615,25 +617,25 @@ scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 
 # init the optimizer(s)
-# adam_params = [dict(params=head_params, lr=args.head_lr), dict(params=embed_params, lr=args.embed_lr), dict(params=scalar_params, lr=args.scalar_lr)]
+adam_params = [dict(params=head_params, lr=args.head_lr), dict(params=embed_params, lr=args.embed_lr), dict(params=scalar_params, lr=args.scalar_lr)]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-# optimizer1 = torch.optim.Adam(adam_params, betas=(args.adam_beta1, args.adam_beta2), fused=True, eps=args.adam_eps)
+optimizer1 = torch.optim.Adam(adam_params, betas=(args.adam_beta1, args.adam_beta2), fused=True, eps=args.adam_eps)
 optimizer2 = Kron(
-    model.parameters(),
+    hidden_matrix_params,
     lr=args.muon_lr,
     b1=args.muon_momentum,
     weight_decay=args.muon_weight_decay,
     preconditioner_update_probability=precond_update_prob_schedule(),
+    max_size_triangular=8192,
+    memory_save_mode=args.memory_save_mode,
     momentum_into_precond_update=True,
-    mu_dtype=torch.bfloat16,
-    precond_dtype=None,
     precond_lr=args.precond_lr,
     precond_init_scale=args.precond_init_scale,
     rank=rank,
     world_size=world_size
 )
-optimizers = [optimizer2]
+optimizers = [optimizer1, optimizer2]
 
 # learning rate schedule: stable then decay
 def get_lr(it: int):

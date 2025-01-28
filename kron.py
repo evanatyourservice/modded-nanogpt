@@ -7,6 +7,11 @@ import numpy as np
 import torch
 from torch import Tensor
 import torch.distributed as dist
+from torch.backends import opt_einsum
+
+
+opt_einsum.enabled = True
+opt_einsum.strategy = "dp"
 
 
 def precond_update_prob_schedule(
@@ -117,7 +122,9 @@ class Kron(torch.optim.Optimizer):
         )
         super().__init__(param_groups, defaults)
 
-        self._tiny = torch.finfo(torch.bfloat16).tiny
+        self._tiny = torch.tensor(
+            torch.finfo(torch.bfloat16).tiny, dtype=torch.bfloat16
+        )
         self._prob_step = 0
         self._update_counter = 0
         self.rng = random.Random(42)
@@ -377,7 +384,11 @@ def _solve_triangular_right(X: Tensor, A: Tensor):
 
 def _calc_A_and_conjB(exprA, G, Q):
     V = torch.randn_like(G, dtype=torch.bfloat16, device=G.device)
-    G += torch.finfo(torch.float32).eps.sqrt().bfloat16() * G.abs().mean() * V
+    G += (
+        torch.tensor(torch.finfo(torch.float32).eps, dtype=torch.bfloat16).sqrt()
+        * G.abs().mean()
+        * V
+    )
     order = G.dim()
     conjB = V.permute(*range(1, order), 0)
     for i, q in enumerate(Q):
@@ -412,3 +423,22 @@ def _update_precond(Q, exprs, G, step, tiny):
 def _precond_grad(Q, exprs, G):
     """Precondition gradient G with preconditioner Q."""
     return torch.einsum(exprs[-1], *Q, *Q, G)
+
+
+def test_kron_one_step():
+    model = torch.nn.Sequential(
+        torch.nn.Linear(4, 8), torch.nn.ReLU(), torch.nn.Linear(8, 2)
+    ).to("cuda")
+    optimizer = Kron(model.parameters())
+    x = torch.randn(2, 4, device="cuda")
+    y = torch.tensor([[1, 0], [0, 1]], device="cuda", dtype=torch.float32)
+    output = model(x)
+    loss = torch.nn.functional.mse_loss(output, y)
+    loss.backward()
+    optimizer.step()
+    print(f"Test loss: {loss.item():.4f}")
+    return loss.item()
+
+
+if __name__ == "__main__":
+    test_kron_one_step()

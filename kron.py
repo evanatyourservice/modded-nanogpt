@@ -265,6 +265,12 @@ def _init_Q_exprs(t, scale, max_size, min_ndim_triangular, memory_save_mode):
 
         if memory_save_mode is None:
             dim_diag = [False for _ in shape]
+        elif memory_save_mode == "smart_one_diag":
+            rev_sorted_dims = np.argsort(shape)[::-1]
+            dim_diag = [False for _ in shape]
+            sorted_shape = sorted(shape)
+            if len(shape) > 1 and sorted_shape[-1] > sorted_shape[-2]:
+                dim_diag[rev_sorted_dims[0]] = True
         elif memory_save_mode == "one_diag":
             rev_sorted_dims = np.argsort(shape)[::-1]
             dim_diag = [False for _ in shape]
@@ -423,22 +429,3 @@ def _update_precond(Q, exprs, G, step, tiny):
 def _precond_grad(Q, exprs, G):
     """Precondition gradient G with preconditioner Q."""
     return torch.einsum(exprs[-1], *Q, *Q, G)
-
-
-def test_kron_one_step():
-    model = torch.nn.Sequential(
-        torch.nn.Linear(4, 8), torch.nn.ReLU(), torch.nn.Linear(8, 2)
-    ).to("cuda")
-    optimizer = Kron(model.parameters())
-    x = torch.randn(2, 4, device="cuda")
-    y = torch.tensor([[1, 0], [0, 1]], device="cuda", dtype=torch.float32)
-    output = model(x)
-    loss = torch.nn.functional.mse_loss(output, y)
-    loss.backward()
-    optimizer.step()
-    print(f"Test loss: {loss.item():.4f}")
-    return loss.item()
-
-
-if __name__ == "__main__":
-    test_kron_one_step()

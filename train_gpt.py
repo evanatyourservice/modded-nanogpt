@@ -514,7 +514,7 @@ class Hyperparameters:
     muon_ns_steps = 5
     muon_weight_decay = 0.1
     max_size_triangular = 2000
-    memory_save_mode = None
+    memory_save_mode = "all_diag"
     precond_lr = 0.1
     precond_init_scale = 0.1
     # adam optimizer settings

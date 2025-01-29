@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 import wandb
-from kron import Kron, precond_update_prob_schedule
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -19,8 +18,12 @@ import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
-
 torch.set_float32_matmul_precision('high')
+from torch.backends import opt_einsum
+opt_einsum.enabled = True
+opt_einsum.strategy = "optimal"
+
+from kron import Kron, precond_update_prob_schedule
 
 # -----------------------------------------------------------------------------
 # Custom operators : FP8 matmul for lm_head by @YouJiacheng
@@ -509,14 +512,15 @@ class Hyperparameters:
     num_iterations = 7500 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # muon optimizer settings
-    muon_lr = 0.0005
+    muon_lr = 0.0003
     muon_momentum = 0.9
     muon_ns_steps = 5
     muon_weight_decay = 0.1
-    max_size_triangular = 2000
-    memory_save_mode = "all_diag"
+    max_size_triangular = 8192
+    memory_save_mode = "one_diag"
     precond_lr = 0.1
-    precond_init_scale = 0.1
+    precond_init_scale = 0.01
+    update_prob = 1 / 10
     # adam optimizer settings
     head_lr = 0.003
     embed_lr = 0.3
@@ -573,6 +577,7 @@ if master_process:
             "memory_save_mode": args.memory_save_mode,
             "precond_lr": args.precond_lr,
             "precond_init_scale": args.precond_init_scale,
+            "update_prob": args.update_prob,
             # adam optimizer
             "head_lr": args.head_lr,
             "embed_lr": args.embed_lr,
@@ -629,7 +634,7 @@ optimizer2 = Kron(
     lr=args.muon_lr,
     b1=args.muon_momentum,
     weight_decay=args.muon_weight_decay,
-    preconditioner_update_probability=precond_update_prob_schedule(),
+    preconditioner_update_probability=precond_update_prob_schedule(min_prob=args.update_prob),
     max_size_triangular=args.max_size_triangular,
     memory_save_mode=args.memory_save_mode,
     momentum_into_precond_update=True,

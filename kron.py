@@ -7,11 +7,7 @@ import numpy as np
 import torch
 from torch import Tensor
 import torch.distributed as dist
-from torch.backends import opt_einsum
-
-
-opt_einsum.enabled = True
-opt_einsum.strategy = "dp"
+from collections import defaultdict
 
 
 def precond_update_prob_schedule(
@@ -39,8 +35,9 @@ def precond_update_prob_schedule(
 
 
 def create_update_buffer(size: int, world_size: int):
-    b = torch.empty(world_size, size, dtype=torch.bfloat16, device="cuda")
-    return dict(update_buffer=b, update_buffer_views=[b[i] for i in range(world_size)])
+    device = torch.device("cuda", torch.cuda.current_device())
+    b = torch.empty(world_size, size, dtype=torch.bfloat16, device=device)
+    return dict(update_buffer=b, update_buffer_views=b.unbind(0))
 
 
 class Kron(torch.optim.Optimizer):
@@ -97,16 +94,20 @@ class Kron(torch.optim.Optimizer):
         self.rank = rank
         self.world_size = world_size
 
-        params = list(params)
-        sizes = {p.numel() for p in params}
+        size_map = defaultdict(list)
+        for p in params:
+            if p.numel() > 0:
+                size_map[p.numel()].append(p)
+
         param_groups = []
-        for size in sizes:
-            group_params = [p for p in params if p.numel() == size]
-            if size > 0:
-                buf_kwargs = create_update_buffer(size, world_size)
-            else:
-                buf_kwargs = {}
-            param_groups.append(dict(params=group_params, **buf_kwargs))
+        for size, group_params in size_map.items():
+            buf_kwargs = create_update_buffer(size, world_size) if size > 0 else {}
+            param_groups.append({"params": group_params, **buf_kwargs})
+
+        if world_size < 1:
+            raise ValueError(f"Invalid world_size {world_size}, must be ≥1")
+        if not 0 <= rank < world_size:
+            raise ValueError(f"Invalid rank {rank} for world_size {world_size}")
 
         defaults = dict(
             lr=lr,
@@ -123,11 +124,13 @@ class Kron(torch.optim.Optimizer):
         super().__init__(param_groups, defaults)
 
         self._tiny = torch.tensor(
-            torch.finfo(torch.bfloat16).tiny, dtype=torch.bfloat16
+            torch.finfo(torch.bfloat16).tiny, dtype=torch.bfloat16, device="cuda"
         )
         self._prob_step = 0
         self._update_counter = 0
         self.rng = random.Random(42)
+
+        self.comm_stream = torch.cuda.Stream()
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -149,16 +152,19 @@ class Kron(torch.optim.Optimizer):
 
         balance = do_update and self.rng.random() < 0.01
 
-        handle = None
-        params_world = None
+        handles = []
+        params_world_list = []
 
         def update_prev():
-            if params_world is None:
-                return
-            assert handle is not None
-            handle.wait()
-            for p_world, g_world in zip(params_world, update_buffer_views):
-                p_world.add_(g_world.view_as(p_world), alpha=-self.defaults["lr"])
+            while handles:
+                handle = handles.pop(0)
+                params_world = params_world_list.pop(0)
+                handle.wait()
+                for p_world, g_world in zip(params_world, update_buffer_views):
+                    with torch.cuda.stream(self.comm_stream):
+                        p_world.add_(
+                            g_world.view_as(p_world), alpha=-self.defaults["lr"]
+                        )
 
         for group in self.param_groups:
             update_buffer = group.get("update_buffer")
@@ -167,23 +173,25 @@ class Kron(torch.optim.Optimizer):
             update_buffer_views = group["update_buffer_views"]
             params = group["params"]
 
-            handle = None
-            params_world = None
-            for base_i in range(len(params))[:: self.world_size]:
-                if base_i + self.rank < len(params):
+            for base_i in range(0, len(params), self.world_size):
+                valid = base_i + self.rank < len(params)
+                if valid:
                     p = params[base_i + self.rank]
+                    grad = p.grad.bfloat16()
 
-                    if p.grad is None:
+                    if grad is None:
                         continue
+
+                    # let's merge smaller dims for better memory management
+                    orig_shape = grad.shape
+                    grad = grad.view(-1, grad.size(-1))
 
                     state = self.state[p]
                     if len(state) == 0:
                         state["step"] = 0
-                        state["momentum_buffer"] = torch.zeros_like(
-                            p, dtype=torch.bfloat16
-                        )
+                        state["momentum_buffer"] = torch.zeros_like(grad)
                         state["Q"], state["exprs"] = _init_Q_exprs(
-                            p,
+                            grad,
                             self.defaults["precond_init_scale"],
                             self.defaults["max_size_triangular"],
                             self.defaults["min_ndim_triangular"],
@@ -194,12 +202,10 @@ class Kron(torch.optim.Optimizer):
 
                     momentum_buffer = state["momentum_buffer"]
                     beta = self.defaults["b1"]
-                    momentum_buffer.mul_(beta).add_(p.grad, alpha=1 - beta)
-                    # keep buffer in bfloat16
-                    momentum_buffer.copy_(momentum_buffer.to(dtype=torch.bfloat16))
+                    momentum_buffer.mul_(beta).add_(grad, alpha=1 - beta)
                     debiased_momentum = momentum_buffer.div(1 - beta ** state["step"])
 
-                    if p.grad.dim() > 1 and balance:
+                    if grad.dim() > 1 and balance:
                         _balance_Q(state["Q"])
 
                     if do_update:
@@ -209,10 +215,10 @@ class Kron(torch.optim.Optimizer):
                             (
                                 debiased_momentum
                                 if self.defaults["momentum_into_precond_update"]
-                                else p.grad.to(dtype=torch.bfloat16)
+                                else grad
                             ),
                             torch.tensor(
-                                self.defaults["precond_lr"], dtype=torch.bfloat16
+                                self.defaults["precond_lr"], dtype=torch.bfloat16, device="cuda"
                             ),
                             self._tiny,
                         )
@@ -225,23 +231,29 @@ class Kron(torch.optim.Optimizer):
                         )
                     )
 
+                    g = g.view(orig_shape)
+
                     if self.defaults["weight_decay"] > 0 and p.dim() >= 2:
                         g.add_(p, alpha=self.defaults["weight_decay"])
 
-                    assert state["momentum_buffer"].dtype == torch.bfloat16
-                    assert debiased_momentum.dtype == torch.bfloat16
-                    assert g.dtype == torch.bfloat16
-                    assert state["Q"][0].dtype == torch.bfloat16
-
                     g = g.flatten()  # flatten before all_gather
                 else:
+                    update_buffer_views[self.rank].zero_()
                     g = update_buffer_views[self.rank]
 
                 update_prev()
-                handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
-                params_world = params[base_i : base_i + self.world_size]
-            update_prev()
+                with torch.cuda.stream(self.comm_stream):
+                    handle = dist.all_gather_into_tensor(
+                        update_buffer, g, async_op=True
+                    )
+                handles.append(handle)
+                params_world_list.append(params[base_i : base_i + self.world_size])
 
+            update_prev()
+            if handles:
+                handles[0].wait()
+
+        torch.cuda.synchronize()
         return loss
 
 
@@ -280,7 +292,7 @@ def _init_Q_exprs(t, scale, max_size, min_ndim_triangular, memory_save_mode):
         else:
             raise ValueError(
                 f"Invalid memory_save_mode: {memory_save_mode}, must be one of "
-                "[None, 'one_diag', 'all_diag']"
+                "[None, 'smart_one_diag', 'one_diag', 'all_diag']"
             )
 
         Q = []
@@ -356,7 +368,7 @@ def _init_Q_exprs(t, scale, max_size, min_ndim_triangular, memory_save_mode):
     return [Q, (exprA, exprGs, exprP)]
 
 
-@torch.compile(fullgraph=True, dynamic=False)
+# @torch.compile(fullgraph=True, dynamic=False)
 def _balance_Q(Q_in):
     norms = torch.stack([q.norm(float("inf")) for q in Q_in])
     geometric_mean = norms.log().mean().exp()
@@ -381,21 +393,24 @@ def _solve_triangular_right(X: Tensor, A: Tensor):
     """X @ inv(A) with minimal float32 usage"""
     return (
         torch.linalg.solve_triangular(
-            A.float(), X.reshape(-1, X.size(-1)).float(), upper=True, left=False
+            A.float(),
+            X.reshape(-1, X.size(-1)).float(),
+            upper=True,
+            left=False,
+            unitriangular=False,
         )
         .reshape_as(X)
-        .to(dtype=torch.bfloat16)
+        .bfloat16()
     )
 
 
 def _calc_A_and_conjB(exprA, G, Q):
-    V = torch.randn_like(G, dtype=torch.bfloat16, device=G.device)
-    G += (
-        torch.tensor(torch.finfo(torch.float32).eps, dtype=torch.bfloat16).sqrt()
-        * G.abs().mean()
-        * V
-    )
     order = G.dim()
+    V = torch.randn_like(G, device=G.device)
+    eps = torch.tensor(
+        torch.finfo(torch.bfloat16).eps, dtype=torch.bfloat16, device=G.device
+    )
+    G += eps.sqrt() * G.abs().mean() * V
     conjB = V.permute(*range(1, order), 0)
     for i, q in enumerate(Q):
         conjB = conjB / q if q.dim() < 2 else _solve_triangular_right(conjB, q)
@@ -405,7 +420,7 @@ def _calc_A_and_conjB(exprA, G, Q):
     return A, conjB
 
 
-@torch.compile(fullgraph=True, dynamic=False)
+# @torch.compile(fullgraph=True, dynamic=False)
 def _update_precond(Q, exprs, G, step, tiny):
     """Update Kronecker product preconditioner Q with pair (V, G)."""
     exprA, exprGs, _ = exprs
@@ -417,15 +432,16 @@ def _update_precond(Q, exprs, G, step, tiny):
         term1 *= step
         norm = term2.norm(float("inf"))
         if q.dim() < 2:
-            term1 *= q.to(term1.dtype) / norm.clamp_(min=tiny)
+            term1 *= q / norm.clamp_(min=tiny)
         else:
             torch.triu(term1, out=term1)
             term1 /= torch.where(norm > 0, _lb(term2, norm), norm).clamp_(tiny)
-            term1 = torch.mm(term1, q.to(term1.dtype))
+            term1 = torch.mm(term1, q)
         q.sub_(term1)
 
 
-@torch.compile(fullgraph=True, dynamic=False)
+# @torch.compile(fullgraph=True, dynamic=False)
 def _precond_grad(Q, exprs, G):
     """Precondition gradient G with preconditioner Q."""
-    return torch.einsum(exprs[-1], *Q, *Q, G)
+    result = torch.einsum(exprs[-1], *Q, *Q, G)
+    return result

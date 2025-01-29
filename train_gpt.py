@@ -20,8 +20,12 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
 torch.set_float32_matmul_precision('high')
 from torch.backends import opt_einsum
-opt_einsum.enabled = True
-opt_einsum.strategy = "optimal"
+if opt_einsum.is_available():
+    opt_einsum.enabled = True
+    opt_einsum.strategy = "dp"
+    print("Using opt_einsum as einsum backend")
+else:
+    print("Warning: opt_einsum is not available")
 
 from kron import Kron, precond_update_prob_schedule
 
@@ -512,14 +516,16 @@ class Hyperparameters:
     num_iterations = 7500 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # muon optimizer settings
-    muon_lr = 0.0003
+    muon_lr = 0.0005
+    warmup_steps = 200
+    min_lr_frac = 0.1
     muon_momentum = 0.9
     muon_ns_steps = 5
     muon_weight_decay = 0.1
     max_size_triangular = 8192
     memory_save_mode = "one_diag"
-    precond_lr = 0.1
-    precond_init_scale = 0.01
+    precond_lr = 0.2
+    precond_init_scale = 0.1
     update_prob = 1 / 10
     # adam optimizer settings
     head_lr = 0.003
@@ -570,6 +576,8 @@ if master_process:
             "model_dim": 1024,
             # muon optimizer
             "muon_lr": args.muon_lr,
+            "warmup_steps": args.warmup_steps,
+            "min_lr_frac": args.min_lr_frac,
             "muon_momentum": args.muon_momentum,
             "muon_ns_steps": args.muon_ns_steps,
             "muon_weight_decay": args.muon_weight_decay,
@@ -625,7 +633,11 @@ scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 
 # init the optimizer(s)
-adam_params = [dict(params=head_params, lr=args.head_lr), dict(params=embed_params, lr=args.embed_lr), dict(params=scalar_params, lr=args.scalar_lr)]
+adam_params = [
+    dict(params=head_params, lr=args.head_lr),
+    dict(params=embed_params, lr=args.embed_lr),
+    dict(params=scalar_params, lr=args.scalar_lr)
+]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = torch.optim.Adam(adam_params, betas=(args.adam_beta1, args.adam_beta2), fused=True, eps=args.adam_eps)
@@ -647,10 +659,15 @@ optimizers = [optimizer1, optimizer2]
 
 # learning rate schedule: stable then decay
 def get_lr(it: int):
-    t = 1 - it / args.num_iterations # time remaining in training
-    assert 1 >= t >= 0
-    w = min(t / args.cooldown_frac, 1.0) # 1 -> 0
-    return w * 1.0 + (1 - w) * 0.1
+    warmup_steps = args.warmup_steps
+    cooldown_start = args.num_iterations - int(args.num_iterations * args.cooldown_frac)
+    if it < warmup_steps:
+        return it / warmup_steps
+    elif it >= cooldown_start:
+        t = (it - cooldown_start) / (args.num_iterations - cooldown_start)
+        return 1.0 - t * (1.0 - args.min_lr_frac)
+    else:
+        return 1.0
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 @lru_cache(1)
 def sw_num_blks(window_size: int):
@@ -732,7 +749,8 @@ for step in range(train_steps + 1):
     model.zero_grad(set_to_none=True)
     # logging
     if step % 10 == 0 and master_process:
-        wandb.log({"loss": loss.item()}, step=step)
+        current_lr_multiplier = get_lr(step)
+        wandb.log({"loss": loss.item(), "lr_multiplier": current_lr_multiplier}, step=step)
     approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms loss:{loss:.4f}", console=True)
 

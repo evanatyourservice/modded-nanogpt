@@ -36,11 +36,6 @@ def precond_update_prob_schedule(max_prob=1.0, min_prob=0.03, decay=0.001, flat_
     return _schedule
 
 
-def create_update_buffer(size: int, world_size: int, dtype: torch.dtype):
-    b = torch.empty(world_size, size, dtype=dtype, device="cuda")
-    return dict(update_buffer=b, update_buffer_views=b.unbind(0))
-
-
 class Kron(torch.optim.Optimizer):
     """Implements PSGD Kron with simple layer-wise pipeline parallelism.
 
@@ -69,6 +64,7 @@ class Kron(torch.optim.Optimizer):
             Default: 0.1
         precond_init_scale (float, optional): Initial scale for preconditioner
             matrices. Default: 1.0
+        partition_grads (bool): Whether to partition gradients.
         block_size (int): Size of partitions for gradient partitioning.
         dtype (torch.dtype): Data type for parameters and gradients.
         rank (int): This worker's rank, used in pipeline partitioning.
@@ -88,6 +84,7 @@ class Kron(torch.optim.Optimizer):
         momentum_into_precond_update=True,
         precond_lr=0.1,
         precond_init_scale=1.0,
+        partition_grads=True,
         block_size=1024,
         dtype=torch.float32,
         rank=0,
@@ -120,6 +117,7 @@ class Kron(torch.optim.Optimizer):
             momentum_into_precond_update=momentum_into_precond_update,
             precond_lr=precond_lr,
             precond_init_scale=precond_init_scale,
+            partition_grads=partition_grads,
             block_size=block_size,
             dtype=dtype,
         )
@@ -183,8 +181,6 @@ class Kron(torch.optim.Optimizer):
                     p = params[param_idx]
                     if p.grad is None:
                         continue
-
-                    # Compute preconditioned gradient
                     grads = p.grad.to(dtype=self.dtype)
                     state = self.state[p]
 
@@ -200,23 +196,32 @@ class Kron(torch.optim.Optimizer):
                         grads = grads.view(*shape)
 
                     # partition grads
-                    if "partitioner" not in state:
-                        dim_diag = get_dim_diag(
-                            self.defaults["memory_save_mode"],
-                            grads.shape,
-                            self.defaults["max_size_triangular"],
-                            self.defaults["min_ndim_triangular"],
-                        )
-                        state["partitioner"] = BlockPartitioner(
-                            grads.shape, self.defaults["block_size"], dim_diag
-                        )
-                    grads_list = state["partitioner"].partition(grads)
+                    if self.defaults["partition_grads"]:
+                        if "partitioner" not in state:
+                            dim_diag = get_dim_diag(
+                                self.defaults["memory_save_mode"],
+                                grads.shape,
+                                self.defaults["max_size_triangular"],
+                                self.defaults["min_ndim_triangular"],
+                            )
+                            state["partitioner"] = BlockPartitioner(
+                                grads.shape, self.defaults["block_size"], dim_diag
+                            )
+                        grads_list = state["partitioner"].partition(grads)
+                    else:
+                        grads_list = [grads]
 
                     precond_grads = []
                     for i, grad in enumerate(grads_list):
                         if f"step_{i}" not in state:
                             state[f"step_{i}"] = 0
                             state[f"momentum_buffer_{i}"] = torch.zeros_like(grad, dtype=self.dtype)
+                            dim_diag = get_dim_diag(
+                                self.defaults["memory_save_mode"],
+                                grads.shape,
+                                self.defaults["max_size_triangular"],
+                                self.defaults["min_ndim_triangular"],
+                            )
                             state[f"Q_{i}"], state[f"exprs_{i}"] = _init_Q_exprs(
                                 grad, self.defaults["precond_init_scale"], dim_diag, self.dtype
                             )
@@ -255,7 +260,10 @@ class Kron(torch.optim.Optimizer):
                         )
 
                     # merge partitions
-                    g = state["partitioner"].merge_partitions(precond_grads)
+                    if self.defaults["partition_grads"]:
+                        g = state["partitioner"].merge_partitions(precond_grads)
+                    else:
+                        g = precond_grads[0]
 
                     # clip grads at RMS 1.1
                     g.mul_(
@@ -285,6 +293,11 @@ class Kron(torch.optim.Optimizer):
                     handles[0].wait()
                 torch.cuda.current_stream().wait_stream(self.comm_stream)
         return loss
+
+
+def create_update_buffer(size: int, world_size: int, dtype: torch.dtype):
+    b = torch.empty(world_size, size, dtype=dtype, device="cuda")
+    return dict(update_buffer=b, update_buffer_views=b.unbind(0))
 
 
 def get_dim_diag(memory_save_mode, shape, max_size, min_ndim):

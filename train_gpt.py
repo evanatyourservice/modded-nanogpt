@@ -509,17 +509,19 @@ class Hyperparameters:
     num_iterations = 7500 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # muon optimizer settings
-    muon_lr = 0.0005
-    warmup_steps = 100
+    muon_lr = 0.003
+    warmup_steps = 0
     min_lr_frac = 0.1
     muon_momentum = 0.9
     muon_ns_steps = 5
-    muon_weight_decay = 0.2
+    muon_weight_decay = 0.3
     max_size_triangular = 10000
     memory_save_mode = None
-    precond_lr = 0.3
+    precond_lr = 1.0
     precond_init_scale = 1.0
+    partition_grads = False
     block_size = 1024
+    optimizer_dtype = torch.float32
     update_prob = 1 / 10
     # adam optimizer settings
     head_lr = 0.003
@@ -579,7 +581,9 @@ if master_process:
             "memory_save_mode": args.memory_save_mode,
             "precond_lr": args.precond_lr,
             "precond_init_scale": args.precond_init_scale,
+            "partition_grads": args.partition_grads,
             "block_size": args.block_size,
+            "optimizer_dtype": args.optimizer_dtype,
             "update_prob": args.update_prob,
             # adam optimizer
             "head_lr": args.head_lr,
@@ -647,8 +651,9 @@ optimizer2 = Kron(
     momentum_into_precond_update=True,
     precond_lr=args.precond_lr,
     precond_init_scale=args.precond_init_scale,
+    partition_grads=args.partition_grads,
     block_size=args.block_size,
-    dtype=torch.float32,
+    dtype=args.optimizer_dtype,
     rank=rank,
     world_size=world_size
 )

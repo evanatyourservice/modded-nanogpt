@@ -38,8 +38,8 @@ def precond_update_prob_schedule(
     return _schedule
 
 
-def create_update_buffer(size: int, world_size: int, device: torch.device):
-    b = torch.empty(world_size, size, dtype=torch.bfloat16, device=device)
+def create_update_buffer(size: int, world_size: int, dtype: torch.dtype, device: torch.device):
+    b = torch.empty(world_size, size, dtype=dtype, device=device)
     return dict(update_buffer=b, update_buffer_views=b.unbind(0))
 
 
@@ -89,6 +89,7 @@ class Kron(torch.optim.Optimizer):
         precond_lr=0.1,
         precond_init_scale=1.0,
         block_size=1024,
+        dtype=torch.float32,
         rank=0,
         world_size=1,
     ):
@@ -108,7 +109,7 @@ class Kron(torch.optim.Optimizer):
         param_groups = [
             dict(
                 params=[p for p in params if p.numel() == size],
-                **create_update_buffer(size, self.world_size, self.device),
+                **create_update_buffer(size, self.world_size, dtype, self.device),
             )
             for size in sizes
         ]
@@ -130,15 +131,15 @@ class Kron(torch.optim.Optimizer):
             precond_lr=precond_lr,
             precond_init_scale=precond_init_scale,
             block_size=block_size,
+            dtype=dtype,
         )
         super().__init__(param_groups, defaults)
 
-        self._tiny = torch.tensor(
-            torch.finfo(torch.bfloat16).tiny, dtype=torch.bfloat16, device=self.device
-        )
+        self._tiny = torch.tensor(torch.finfo(dtype).tiny, dtype=dtype, device=self.device)
         self._prob_step = 0
         self._update_counter = 0
         self.rng = random.Random(42)
+        self.dtype = dtype
 
         if self.device.type == "cuda":
             self.comm_stream = torch.cuda.Stream()
@@ -172,14 +173,21 @@ class Kron(torch.optim.Optimizer):
             while handles:
                 handle = handles.pop(0)
                 params_world = params_world_list.pop(0)
+                if params_world is None:
+                    continue
+                    
                 if self.is_distributed:
                     handle.wait()
-                for p_world, g_world in zip(params_world, update_buffer_views):
-                    with torch.cuda.stream(self.comm_stream) if self.comm_stream else torch.cuda.stream(nullcontext()):
+                    views = update_buffer_views
+                else:
+                    views = [update_buffer_views[0]]
+
+                for p_world, g_world in zip([params_world], views):
+                    with torch.cuda.stream(self.comm_stream) if self.comm_stream else nullcontext():
                         update = g_world.view_as(p_world)
                         if group["weight_decay"] > 0 and p_world.dim() >= 2:
                             update.add_(p_world, alpha=group["weight_decay"])
-                        p_world.add_(update, alpha=-group["lr"])
+                        p_world.add_(update.to(dtype=p_world.dtype), alpha=-group["lr"])
 
         for group in self.param_groups:
             update_buffer = group.get("update_buffer")
@@ -188,12 +196,14 @@ class Kron(torch.optim.Optimizer):
             update_buffer_views = group["update_buffer_views"]
             params = group["params"]
 
-            for base_i in range(len(params))[:: self.world_size]:
-                if base_i + self.rank < len(params):
-                    p = params[base_i + self.rank]
+            total_params = len(params)
+            for chunk_idx in range((total_params + self.world_size - 1) // self.world_size):
+                param_idx = chunk_idx * self.world_size + self.rank
+                if param_idx < total_params:
+                    p = params[param_idx]
                     if p.grad is None:
                         continue
-                    grads = p.grad.bfloat16()
+                    grads = p.grad.to(dtype=self.dtype)
                     state = self.state[p]
 
                     # merge smaller dims
@@ -225,9 +235,9 @@ class Kron(torch.optim.Optimizer):
                     for i, grad in enumerate(grads_list):
                         if f"step_{i}" not in state:
                             state[f"step_{i}"] = 0
-                            state[f"momentum_buffer_{i}"] = torch.zeros_like(grad)
+                            state[f"momentum_buffer_{i}"] = torch.zeros_like(grad, dtype=self.dtype)
                             state[f"Q_{i}"], state[f"exprs_{i}"] = _init_Q_exprs(
-                                grad, self.defaults["precond_init_scale"], dim_diag
+                                grad, self.defaults["precond_init_scale"], dim_diag, self.dtype
                             )
 
                         state[f"step_{i}"] += 1
@@ -253,7 +263,7 @@ class Kron(torch.optim.Optimizer):
                                 ),
                                 torch.tensor(
                                     self.defaults["precond_lr"],
-                                    dtype=torch.bfloat16,
+                                    dtype=self.dtype,
                                     device=self.device,
                                 ),
                                 self._tiny,
@@ -269,7 +279,7 @@ class Kron(torch.optim.Optimizer):
 
                     g.mul_(
                         torch.minimum(
-                            torch.tensor(1.0), 1.1 / g.square().mean().sqrt().add(1e-6)
+                            torch.tensor(1.0, dtype=self.dtype), 1.1 / g.square().mean().sqrt().add(1e-6)
                         )
                     )
 
@@ -284,12 +294,20 @@ class Kron(torch.optim.Optimizer):
                         update_buffer, g, async_op=True
                     )
                 else:
-                    update_buffer_views[0].copy_(g, non_blocking=True)
-                    handle = None
+                    if self.comm_stream:
+                        torch.cuda.current_stream().wait_stream(self.comm_stream)
+                    # Non-distributed: apply update directly to parameter
+                    if param_idx < total_params:
+                        p = params[param_idx]
+                        update = g.view_as(p)
+                        if group["weight_decay"] > 0 and p.dim() >= 2:
+                            update.add_(p, alpha=group["weight_decay"])
+                        p.add_(update.to(dtype=p.dtype), alpha=-group["lr"])
+                    handle = None  # No handle needed for direct update
                 
                 if handle is not None:
                     handles.append(handle)
-                params_world_list.append(params[base_i : base_i + self.world_size])
+                params_world_list.append(params[param_idx] if param_idx < total_params else None)
 
             update_prev()
             if handles:
@@ -326,13 +344,13 @@ def get_dim_diag(memory_save_mode, shape, max_size, min_ndim):
     return dim_diag
 
 
-def _init_Q_exprs(t, scale, dim_diag):
+def _init_Q_exprs(t, scale, dim_diag, dtype):
     """Initialize preconditioner Q and reusable einsum expressions."""
     letters = string.ascii_lowercase + string.ascii_uppercase
 
     shape = t.shape
     if len(shape) == 0:  # scalar
-        Q = [scale * torch.ones_like(t, dtype=torch.bfloat16)]
+        Q = [scale * torch.ones_like(t, dtype=dtype)]
         exprA = ",->"
         exprGs = [",->"]
         exprP = ",,->"
@@ -352,7 +370,7 @@ def _init_Q_exprs(t, scale, dim_diag):
             if dim_d:
                 # use diagonal matrix as preconditioner for this dim
                 Q.append(
-                    scale * torch.ones(shape[i], dtype=torch.bfloat16, device=t.device)
+                    scale * torch.ones(shape[i], dtype=dtype, device=t.device)
                 )
 
                 piece1A.append(letters[i])
@@ -375,7 +393,7 @@ def _init_Q_exprs(t, scale, dim_diag):
             else:
                 # use triangular matrix as preconditioner for this dim
                 Q.append(
-                    scale * torch.eye(shape[i], dtype=torch.bfloat16, device=t.device)
+                    scale * torch.eye(shape[i], dtype=dtype, device=t.device)
                 )
 
                 piece1A.append(letters[i] + letters[i + 13])
@@ -437,6 +455,7 @@ def _lb(A: Tensor, max_abs: Tensor):
 
 def _solve_triangular_right(X: Tensor, A: Tensor):
     """X @ inv(A) with minimal float32 usage"""
+    orig_dtype = A.dtype
     return (
         torch.linalg.solve_triangular(
             A.float(),
@@ -446,7 +465,7 @@ def _solve_triangular_right(X: Tensor, A: Tensor):
             unitriangular=False,
         )
         .reshape_as(X)
-        .bfloat16()
+        .to(dtype=orig_dtype)
     )
 
 
@@ -454,7 +473,7 @@ def _calc_A_and_conjB(exprA, G, Q):
     order = G.dim()
     V = torch.randn_like(G, device=G.device)
     eps = torch.tensor(
-        torch.finfo(torch.bfloat16).eps, dtype=torch.bfloat16, device=G.device
+        torch.finfo(torch.float32).eps, dtype=G.dtype, device=G.device
     )
     G += eps.sqrt() * G.abs().mean() * V
     conjB = V.permute(*range(1, order), 0)
@@ -613,7 +632,7 @@ if __name__ == "__main__":
         if device == "cuda":
             torch.cuda.empty_cache()
 
-    print("\nTesting one-step optimization with memory profiling...")
+    print("\nTesting optimization over 50 steps...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     def test_optimization_step():
@@ -623,42 +642,62 @@ if __name__ == "__main__":
             torch.nn.Linear(8192, 1024)
         ).to(device)
         
-        optimizer = Kron(model.parameters(), lr=0.0001, block_size=512)
+        with torch.no_grad():
+            for layer in model:
+                if isinstance(layer, torch.nn.Linear):
+                    layer.weight.normal_(0, 0.02)
+                    layer.bias.zero_()
         
-        x = torch.randn(512, 1024, device=device)
-        y = torch.randn(512, 1024, device=device)
+        optimizer = Kron(model.parameters(), lr=0.001, block_size=512, precond_lr=0.1)
         
-        output = model(x)
-        loss = torch.nn.functional.mse_loss(output, y)
+        x = torch.randn(512, 1024, device=device) * 0.1
+        y = torch.randn(512, 1024, device=device) * 0.1
         
-        loss.backward()
-        
+        losses = []
         if device.type == 'cuda':
             torch.cuda.reset_peak_memory_stats()
         start_mem = torch.cuda.memory_allocated() if device.type == 'cuda' else 0
         
-        optimizer.step()
+        # Run 50 optimization steps
+        for step in range(100):
+            optimizer.zero_grad()
+            output = model(x)
+            loss = torch.nn.functional.mse_loss(output, y)
+            loss.backward()
+            
+            optimizer.step()
+            losses.append(loss.item())
+            
+            if step % 10 == 0:
+                print(f"Step {step}: loss {losses[-1]:.4f}")
+
+        final_output = model(x)
+        final_loss = torch.nn.functional.mse_loss(final_output, y)
         
         if device.type == 'cuda':
+            torch.cuda.synchronize()
             end_mem = torch.cuda.memory_allocated()
             peak_mem = torch.cuda.max_memory_allocated()
-            return loss.item(), start_mem, end_mem, peak_mem
-        return loss.item(), 0, 0, 0
+            return losses[0], final_loss.item(), start_mem, end_mem, peak_mem
+        return losses[0], final_loss.item(), 0, 0, 0
 
+    # Warmup run
     _ = test_optimization_step()
     
+    # Actual test runs
     for i in range(3):
         if device.type == 'cuda':
             torch.cuda.empty_cache()
-        loss, start_mem, end_mem, peak_mem = test_optimization_step()
+        initial_loss, final_loss, start_mem, end_mem, peak_mem = test_optimization_step()
+        
+        print(f"\nRun {i+1}:")
+        print(f"Initial loss: {initial_loss:.4f}")
+        print(f"Final loss (step 50): {final_loss:.4f}")
+        assert final_loss < initial_loss, "Loss did not decrease!"
         
         if device.type == 'cuda':
-            print(f"\nRun {i+1}:")
-            print(f"Start memory: {start_mem/1024**2:.2f} MB")
-            print(f"End memory: {end_mem/1024**2:.2f} MB") 
             print(f"Peak memory: {peak_mem/1024**2:.2f} MB")
             print(f"Memory delta: {(end_mem - start_mem)/1024**2:.2f} MB")
-        print(f"Loss: {loss:.4f}")
 
     if device.type == 'cuda':
         torch.cuda.empty_cache()

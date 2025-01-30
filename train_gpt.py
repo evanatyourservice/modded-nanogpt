@@ -510,15 +510,16 @@ class Hyperparameters:
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # muon optimizer settings
     muon_lr = 0.0005
-    warmup_steps = 100
+    warmup_steps = 5
     min_lr_frac = 0.1
     muon_momentum = 0.9
     muon_ns_steps = 5
     muon_weight_decay = 0.1
-    max_size_triangular = 8192
-    memory_save_mode = "one_diag"
-    precond_lr = 0.2
-    precond_init_scale = 0.1
+    max_size_triangular = 10000
+    memory_save_mode = None
+    precond_lr = 0.1
+    precond_init_scale = 1.0
+    block_size = 1024
     update_prob = 1 / 10
     # adam optimizer settings
     head_lr = 0.003
@@ -578,6 +579,7 @@ if master_process:
             "memory_save_mode": args.memory_save_mode,
             "precond_lr": args.precond_lr,
             "precond_init_scale": args.precond_init_scale,
+            "block_size": args.block_size,
             "update_prob": args.update_prob,
             # adam optimizer
             "head_lr": args.head_lr,
@@ -620,22 +622,22 @@ for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
 # collect the parameters to optimize
-hidden_matrix_params = [p for p in model.blocks.parameters() if p.ndim >= 2]
-embed_params = [model.embed.weight, *model.value_embeds.parameters()]
-scalar_params = [p for p in model.parameters() if p.ndim < 2]
-head_params = [model.lm_head.weight]
+# hidden_matrix_params = [p for p in model.blocks.parameters() if p.ndim >= 2]
+# embed_params = [model.embed.weight, *model.value_embeds.parameters()]
+# scalar_params = [p for p in model.parameters() if p.ndim < 2]
+# head_params = [model.lm_head.weight]
 
 # init the optimizer(s)
-adam_params = [
-    dict(params=head_params, lr=args.head_lr),
-    dict(params=embed_params, lr=args.embed_lr),
-    dict(params=scalar_params, lr=args.scalar_lr)
-]
+# adam_params = [
+#     dict(params=head_params, lr=args.head_lr),
+#     dict(params=embed_params, lr=args.embed_lr),
+#     dict(params=scalar_params, lr=args.scalar_lr)
+# ]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-optimizer1 = torch.optim.Adam(adam_params, betas=(args.adam_beta1, args.adam_beta2), fused=True, eps=args.adam_eps)
+# optimizer1 = torch.optim.Adam(adam_params, betas=(args.adam_beta1, args.adam_beta2), fused=True, eps=args.adam_eps)
 optimizer2 = Kron(
-    hidden_matrix_params,
+    model.parameters(),
     lr=args.muon_lr,
     b1=args.muon_momentum,
     weight_decay=args.muon_weight_decay,
@@ -645,10 +647,12 @@ optimizer2 = Kron(
     momentum_into_precond_update=True,
     precond_lr=args.precond_lr,
     precond_init_scale=args.precond_init_scale,
+    block_size=args.block_size,
+    dtype=torch.float32,
     rank=rank,
     world_size=world_size
 )
-optimizers = [optimizer1, optimizer2]
+optimizers = [optimizer2]
 
 # learning rate schedule: stable then decay
 def get_lr(it: int):

@@ -510,14 +510,14 @@ class Hyperparameters:
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # muon optimizer settings
     muon_lr = 0.0005
-    warmup_steps = 5
+    warmup_steps = 100
     min_lr_frac = 0.1
     muon_momentum = 0.9
     muon_ns_steps = 5
-    muon_weight_decay = 0.1
+    muon_weight_decay = 0.2
     max_size_triangular = 10000
     memory_save_mode = None
-    precond_lr = 0.1
+    precond_lr = 0.3
     precond_init_scale = 1.0
     block_size = 1024
     update_prob = 1 / 10

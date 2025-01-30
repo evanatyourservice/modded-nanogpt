@@ -3,6 +3,7 @@
 import string
 import random
 import numpy as np
+import time
 
 import torch
 from torch import Tensor
@@ -178,70 +179,87 @@ class Kron(torch.optim.Optimizer):
             for base_i in range(len(params))[:: self.world_size]:
                 if base_i + self.rank < len(params):
                     p = params[base_i + self.rank]
-
-                    if grad is None:
+                    if p.grad is None:
                         continue
-
-                    grad = p.grad.bfloat16()
-
-                    # let's merge smaller dims for better memory management
-                    orig_shape = grad.shape
-                    grad = grad.view(-1, grad.size(-1))
-
                     state = self.state[p]
+                    grads = p.grad.bfloat16()
 
-                    if "partitioner" not in self.state[p]:
+                    # merge smaller dims
+                    if grads.dim() > 1:
+                        if "merged_shape" not in self.state[p]:
+                            shape1 = [np.prod(grads.shape[:-1]), grads.shape[-1]]
+                            shape2 = [grads.shape[0], np.prod(grads.shape[1:])]
+                            shape = (
+                                shape1 if np.diff(shape1) <= np.diff(shape2) else shape2
+                            )
+                            state["merged_shape"] = shape
+                        else:
+                            shape = state["merged_shape"]
+                        grads = grads.view(*shape)
 
-                    if len(state) == 0:
-                        state["step"] = 0
-                        state["momentum_buffer"] = torch.zeros_like(grad)
-                        state["Q"], state["exprs"] = _init_Q_exprs(
-                            grad,
-                            self.defaults["precond_init_scale"],
+                    if "partitioner" not in state:
+                        dim_diag = get_dim_diag(
+                            self.defaults["memory_save_mode"],
+                            grads.shape,
                             self.defaults["max_size_triangular"],
                             self.defaults["min_ndim_triangular"],
-                            self.defaults["memory_save_mode"],
+                        )
+                        state["partitioner"] = BlockPartitioner(
+                            grads.shape, self.defaults["block_size"], dim_diag
                         )
 
-                    state["step"] += 1
+                    grads_list = state["partitioner"].partition(grads)
+                    precond_grads = []
+                    for i, grad in enumerate(grads_list):
+                        if f"step_{i}" not in state:
+                            state[f"step_{i}"] = 0
+                            state[f"momentum_buffer_{i}"] = torch.zeros_like(grad)
+                            state[f"Q_{i}"], state[f"exprs_{i}"] = _init_Q_exprs(
+                                grad, self.defaults["precond_init_scale"], dim_diag
+                            )
 
-                    momentum_buffer = state["momentum_buffer"]
-                    beta = self.defaults["b1"]
-                    momentum_buffer.mul_(beta).add_(grad, alpha=1 - beta)
-                    debiased_momentum = momentum_buffer.div(1 - beta ** state["step"])
+                        state[f"step_{i}"] += 1
 
-                    if grad.dim() > 1 and balance:
-                        _balance_Q(state["Q"])
-
-                    if do_update:
-                        _update_precond(
-                            state["Q"],
-                            state["exprs"],
-                            (
-                                debiased_momentum
-                                if self.defaults["momentum_into_precond_update"]
-                                else grad
-                            ),
-                            torch.tensor(
-                                self.defaults["precond_lr"],
-                                dtype=torch.bfloat16,
-                                device="cuda",
-                            ),
-                            self._tiny,
+                        momentum_buffer = state[f"momentum_buffer_{i}"]
+                        beta = self.defaults["b1"]
+                        momentum_buffer.mul_(beta).add_(grad, alpha=1 - beta)
+                        debiased_momentum = momentum_buffer.div(
+                            1 - beta ** state[f"step_{i}"]
                         )
 
-                    g = _precond_grad(state["Q"], state["exprs"], debiased_momentum)
+                        if grad.dim() > 1 and balance:
+                            _balance_Q(state[f"Q_{i}"])
+
+                        if do_update:
+                            _update_precond(
+                                state[f"Q_{i}"],
+                                state[f"exprs_{i}"],
+                                (
+                                    debiased_momentum
+                                    if self.defaults["momentum_into_precond_update"]
+                                    else grad
+                                ),
+                                torch.tensor(
+                                    self.defaults["precond_lr"],
+                                    dtype=torch.bfloat16,
+                                    device="cuda",
+                                ),
+                                self._tiny,
+                            )
+
+                        precond_grads.append(
+                            _precond_grad(
+                                state[f"Q_{i}"], state[f"exprs_{i}"], debiased_momentum
+                            )
+                        )
+
+                    grads = state["partitioner"].merge_partitions(precond_grads)
 
                     g.mul_(
                         torch.minimum(
                             torch.tensor(1.0), 1.1 / g.square().mean().sqrt().add(1e-6)
                         )
                     )
-
-                    g = g.view(orig_shape)
-
-                    if self.defaults["weight_decay"] > 0 and p.dim() >= 2:
-                        g.add_(p, alpha=self.defaults["weight_decay"])
 
                     g = g.flatten()  # flatten before all_gather
                 else:
@@ -292,7 +310,7 @@ def get_dim_diag(memory_save_mode, shape, max_size, min_ndim):
     return dim_diag
 
 
-def _init_Q_exprs(t, scale, max_size, min_ndim_triangular, memory_save_mode):
+def _init_Q_exprs(t, scale, dim_diag):
     """Initialize preconditioner Q and reusable einsum expressions."""
     letters = string.ascii_lowercase + string.ascii_uppercase
 
@@ -309,8 +327,6 @@ def _init_Q_exprs(t, scale, max_size, min_ndim_triangular, memory_save_mode):
             )
 
         scale = scale ** (1 / len(shape))
-
-        dim_diag = get_dim_diag(memory_save_mode, shape, max_size, min_ndim_triangular)
 
         Q = []
         piece1A, piece2A, piece3A = ([], "", "")
@@ -457,79 +473,128 @@ def _update_precond(Q, exprs, G, step, tiny):
 # @torch.compile(fullgraph=True, dynamic=False)
 def _precond_grad(Q, exprs, G):
     """Precondition gradient G with preconditioner Q."""
-    result = torch.einsum(exprs[-1], *Q, *Q, G)
-    return result
+    return torch.einsum(exprs[-1], *Q, *Q, G)
 
 
 class BlockPartitioner:
     """Partitions a tensor into smaller tensors.
-    
+
     Modified from distributed_shampoo.
     https://github.com/google-research/google-research/blob/master/scalable_shampoo/optax/distributed_shampoo.py
+
+    Scalable Second Order Optimization for Deep Learning by
+    Rohan Anil, Vineet Gupta, Tomer Koren, Kevin Regan, Yoram Singer
+    https://arxiv.org/abs/2002.09018
     """
-    
+
     def __init__(self, param_shape, block_size, dim_diag):
-        assert len(dim_diag) == len(param_shape), "dim_diag must match param_shape length"
+        assert len(dim_diag) == len(
+            param_shape
+        ), "dim_diag must have same length as param_shape"
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self._shape = param_shape
-        self.block_size = block_size
-        self._splits = []
-        split_sizes = []
-        
-        # Calculate split points for each dimension
+        self._split_indices = []
+        self._split_dims = []
         for i, (d, is_diag) in enumerate(zip(param_shape, dim_diag)):
             if 0 < block_size < d and not is_diag:
-                # Calculate split indices using numpy-style splitting
-                nsplit = (d - 1) // block_size  # Ensures last block isn't empty
-                indices = (torch.arange(nsplit, dtype=torch.int32) + 1) * block_size
-                sizes = [block_size] * nsplit + [d - nsplit * block_size]
-                self._splits.append((i, indices))
-                split_sizes.append(torch.tensor(sizes, dtype=torch.int32))
-            else:
-                split_sizes.append(torch.tensor([d], dtype=torch.int32))
-        
-        self._split_sizes = split_sizes
-        self._padded_stacked_shape = self._calculate_padded_shape()
+                nsplit = (d - 1) // block_size
+                if nsplit > 0:
+                    self._split_indices.append(
+                        [(j + 1) * block_size for j in range(nsplit)]
+                    )
+                    self._split_dims.append(i)
 
-    def _calculate_padded_shape(self):
-        # Calculate padded shape for potential later use
-        single_shape = [s[0].item() for s in self._split_sizes]
-        padded_single_shape = [
-            -(-dim // self.block_size) * self.block_size for dim in single_shape
-        ]
-        stack_size = max(1, np.prod([len(s) for s in self._split_sizes]))
-        return (stack_size,) + tuple(padded_single_shape)
-
-    def split_sizes(self):
-        return self._split_sizes
+        self._total_blocks = (
+            np.prod([len(indices) + 1 for indices in self._split_indices])
+            if self._split_indices
+            else 1
+        )
 
     def partition(self, tensor):
-        """Split tensor into blocks using precomputed split points."""
-        assert tensor.shape == self._shape, "Input tensor shape mismatch"
+        assert tensor.shape == self._shape
         blocks = [tensor]
-        
-        for dim, indices in self._splits:
+
+        for dim, indices in zip(self._split_dims, self._split_indices):
             new_blocks = []
             for block in blocks:
-                # Split along current dimension using exact indices
-                split_blocks = torch.tensor_split(block, indices.cpu(), dim=dim)
+                split_blocks = torch.tensor_split(block, indices, dim=dim)
                 new_blocks.extend(split_blocks)
             blocks = new_blocks
-            
-        return tuple(blocks)
+
+        return blocks
 
     def merge_partitions(self, partitions):
-        """Merge blocks back to original shape using inverse splitting order."""
         blocks = list(partitions)
-        
-        for dim, indices in reversed(self._splits):
-            n = len(indices) + 1  # Number of splits per tensor
+
+        for dim, indices in zip(
+            reversed(self._split_dims), reversed(self._split_indices)
+        ):
+            n = len(indices) + 1
             merged = []
-            while blocks:
-                # Take n blocks and concatenate along original dimension
-                to_merge = blocks[:n]
-                merged.append(torch.cat(to_merge, dim=dim))
-                blocks = blocks[n:]
+
+            for i in range(0, len(blocks), n):
+                merged.append(torch.cat(blocks[i : i + n], dim=dim))
             blocks = merged
-            
-        assert len(blocks) == 1, "Merging failed to reconstruct original tensor"
+
         return blocks[0]
+
+
+if __name__ == "__main__":
+    print("\nTesting BlockPartitioner...")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    test_cases = [
+        ((64, 64), 32),
+        ((256, 256), 64),
+        ((2048, 2048), 128),
+        ((4096, 4096), 256),
+        ((16, 32, 64), 32),
+    ]
+
+    WARMUP_RUNS = 3
+    TIMING_RUNS = 5
+
+    for shape, block_size in test_cases:
+        print(f"\nShape: {shape}, block_size: {block_size}")
+
+        x = torch.arange(np.prod(shape), dtype=torch.float32, device=device).reshape(
+            shape
+        )
+        partitioner = BlockPartitioner(x.shape, block_size, [False] * len(shape))
+
+        # Warmup runs
+        for _ in range(WARMUP_RUNS):
+            blocks = partitioner.partition(x)
+            merged = partitioner.merge_partitions(blocks)
+            del blocks, merged
+
+        # Timing runs
+        times = []
+        error = 0
+        for _ in range(TIMING_RUNS):
+            if device == "cuda":
+                torch.cuda.synchronize()
+            start = time.perf_counter()
+
+            blocks = partitioner.partition(x)
+            merged = partitioner.merge_partitions(blocks)
+
+            if device == "cuda":
+                torch.cuda.synchronize()
+            times.append(time.perf_counter() - start)
+
+            error = max(error, (x - merged).abs().max().item())
+            del blocks, merged
+
+        avg_time = sum(times) / len(times)
+        std_time = (sum((t - avg_time) ** 2 for t in times) / len(times)) ** 0.5
+
+        print(
+            f"Blocks: {partitioner._total_blocks}, "
+            f"Time: {avg_time*1000:.1f}±{std_time*1000:.1f}ms, "
+            f"Error: {error:.2e}"
+        )
+
+        if device == "cuda":
+            torch.cuda.empty_cache()

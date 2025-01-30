@@ -24,7 +24,7 @@ def precond_update_prob_schedule(
     training regimes.
     """
 
-    @torch.compile(fullgraph=True, dynamic=False)
+    # @torch.compile(fullgraph=True, dynamic=False)
     def _schedule(n):
         """Exponential anneal with flat start."""
         prob = max_prob * torch.exp(-decay * (n - flat_start))
@@ -34,8 +34,7 @@ def precond_update_prob_schedule(
     return _schedule
 
 
-def create_update_buffer(size: int, world_size: int):
-    device = torch.device("cuda", torch.cuda.current_device())
+def create_update_buffer(size: int, world_size: int, device: torch.device):
     b = torch.empty(world_size, size, dtype=torch.bfloat16, device=device)
     return dict(update_buffer=b, update_buffer_views=b.unbind(0))
 
@@ -89,18 +88,22 @@ class Kron(torch.optim.Optimizer):
         rank=0,
         world_size=1,
     ):
-        if preconditioner_update_probability is None:
-            preconditioner_update_probability = precond_update_prob_schedule()
-
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if self.device.type == "cpu":
+            rank = 0
+            world_size = 1
         self.rank = rank
         self.world_size = world_size
+
+        if preconditioner_update_probability is None:
+            preconditioner_update_probability = precond_update_prob_schedule()
 
         params = list(params)
         sizes = {p.numel() for p in params}
         param_groups = [
             dict(
                 params=[p for p in params if p.numel() == size],
-                **create_update_buffer(size, world_size),
+                **create_update_buffer(size, self.world_size, self.device),
             )
             for size in sizes
         ]
@@ -126,13 +129,16 @@ class Kron(torch.optim.Optimizer):
         super().__init__(param_groups, defaults)
 
         self._tiny = torch.tensor(
-            torch.finfo(torch.bfloat16).tiny, dtype=torch.bfloat16, device="cuda"
+            torch.finfo(torch.bfloat16).tiny, dtype=torch.bfloat16, device=self.device
         )
         self._prob_step = 0
         self._update_counter = 0
         self.rng = random.Random(42)
 
-        self.comm_stream = torch.cuda.Stream()
+        if self.device.type == "cuda":
+            self.comm_stream = torch.cuda.Stream()
+        else:
+            self.comm_stream = None
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -242,7 +248,7 @@ class Kron(torch.optim.Optimizer):
                                 torch.tensor(
                                     self.defaults["precond_lr"],
                                     dtype=torch.bfloat16,
-                                    device="cuda",
+                                    device=self.device,
                                 ),
                                 self._tiny,
                             )
@@ -253,7 +259,7 @@ class Kron(torch.optim.Optimizer):
                             )
                         )
 
-                    grads = state["partitioner"].merge_partitions(precond_grads)
+                    g = state["partitioner"].merge_partitions(precond_grads)
 
                     g.mul_(
                         torch.minimum(
@@ -267,18 +273,30 @@ class Kron(torch.optim.Optimizer):
                     g = update_buffer_views[self.rank]
 
                 update_prev()
-                with torch.cuda.stream(self.comm_stream):
-                    handle = dist.all_gather_into_tensor(
-                        update_buffer, g, async_op=True
-                    )
-                handles.append(handle)
+                if self.world_size > 1 and self.device.type == "cuda":
+                    if self.comm_stream:
+                        with torch.cuda.stream(self.comm_stream):
+                            handle = dist.all_gather_into_tensor(
+                                update_buffer, g, async_op=True
+                            )
+                    else:
+                        handle = dist.all_gather_into_tensor(
+                            update_buffer, g, async_op=True
+                        )
+                else:
+                    update_buffer_views[0].copy_(g)
+                    handle = None
+                
+                if handle is not None:
+                    handles.append(handle)
                 params_world_list.append(params[base_i : base_i + self.world_size])
 
             update_prev()
             if handles:
                 handles[0].wait()
 
-        torch.cuda.synchronize()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
         return loss
 
 
@@ -563,13 +581,11 @@ if __name__ == "__main__":
         )
         partitioner = BlockPartitioner(x.shape, block_size, [False] * len(shape))
 
-        # Warmup runs
         for _ in range(WARMUP_RUNS):
             blocks = partitioner.partition(x)
             merged = partitioner.merge_partitions(blocks)
             del blocks, merged
 
-        # Timing runs
         times = []
         error = 0
         for _ in range(TIMING_RUNS):
@@ -598,3 +614,28 @@ if __name__ == "__main__":
 
         if device == "cuda":
             torch.cuda.empty_cache()
+
+    print("\nTesting one-step optimization...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    model = torch.nn.Sequential(
+        torch.nn.Linear(4, 8),
+        torch.nn.Linear(8, 2)
+    ).to(device)
+    
+    optimizer = Kron(model.parameters(), lr=0.01)
+    
+    x = torch.randn(2, 4, device=device)
+    y = torch.tensor([[1, 0], [0, 1]], device=device).float()
+    
+    output = model(x)
+    loss = torch.nn.functional.mse_loss(output, y)
+    
+    loss.backward()
+    
+    optimizer.step()
+    
+    print(f"Test complete - Loss: {loss.item():.3f}")
+    
+    if device == "cuda":
+        torch.cuda.empty_cache()

@@ -9,6 +9,10 @@ import numpy as np
 import torch
 from torch import Tensor
 import torch.distributed as dist
+from torch.backends import opt_einsum
+opt_einsum.set_flags(True, "optimal")
+print(f"opt_einsum enabled: {opt_einsum.enabled}, opt_einsum strategy: {opt_einsum.strategy}")
+torch.set_float32_matmul_precision('high')
 
 
 def precond_update_prob_schedule(
@@ -25,7 +29,6 @@ def precond_update_prob_schedule(
     training regimes.
     """
 
-    # @torch.compile(fullgraph=True, dynamic=False)
     def _schedule(n):
         """Exponential anneal with flat start."""
         prob = max_prob * torch.exp(-decay * (n - flat_start))
@@ -190,8 +193,8 @@ class Kron(torch.optim.Optimizer):
                     p = params[base_i + self.rank]
                     if p.grad is None:
                         continue
-                    state = self.state[p]
                     grads = p.grad.bfloat16()
+                    state = self.state[p]
 
                     # merge smaller dims
                     if grads.dim() > 1:
@@ -411,7 +414,7 @@ def _init_Q_exprs(t, scale, dim_diag):
     return [Q, (exprA, exprGs, exprP)]
 
 
-# @torch.compile(fullgraph=True, dynamic=False)
+@torch.compile(fullgraph=True, dynamic=False)
 def _balance_Q(Q_in):
     norms = torch.stack([q.norm(float("inf")) for q in Q_in])
     geometric_mean = norms.log().mean().exp()
@@ -463,7 +466,7 @@ def _calc_A_and_conjB(exprA, G, Q):
     return A, conjB
 
 
-# @torch.compile(fullgraph=True, dynamic=False)
+@torch.compile(fullgraph=True, dynamic=False)
 def _update_precond(Q, exprs, G, step, tiny):
     """Update Kronecker product preconditioner Q with pair (V, G)."""
     exprA, exprGs, _ = exprs
@@ -483,7 +486,7 @@ def _update_precond(Q, exprs, G, step, tiny):
         q.sub_(term1)
 
 
-# @torch.compile(fullgraph=True, dynamic=False)
+@torch.compile(fullgraph=True, dynamic=False)
 def _precond_grad(Q, exprs, G):
     """Precondition gradient G with preconditioner Q."""
     return torch.einsum(exprs[-1], *Q, *Q, G)
@@ -610,27 +613,52 @@ if __name__ == "__main__":
         if device == "cuda":
             torch.cuda.empty_cache()
 
-    print("\nTesting one-step optimization...")
+    print("\nTesting one-step optimization with memory profiling...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    model = torch.nn.Sequential(
-        torch.nn.Linear(4, 8),
-        torch.nn.Linear(8, 2)
-    ).to(device)
+    def test_optimization_step():
+        model = torch.nn.Sequential(
+            torch.nn.Linear(1024, 8192),
+            torch.nn.ReLU(),
+            torch.nn.Linear(8192, 1024)
+        ).to(device)
+        
+        optimizer = Kron(model.parameters(), lr=0.0001, block_size=512)
+        
+        x = torch.randn(512, 1024, device=device)
+        y = torch.randn(512, 1024, device=device)
+        
+        output = model(x)
+        loss = torch.nn.functional.mse_loss(output, y)
+        
+        loss.backward()
+        
+        if device.type == 'cuda':
+            torch.cuda.reset_peak_memory_stats()
+        start_mem = torch.cuda.memory_allocated() if device.type == 'cuda' else 0
+        
+        optimizer.step()
+        
+        if device.type == 'cuda':
+            end_mem = torch.cuda.memory_allocated()
+            peak_mem = torch.cuda.max_memory_allocated()
+            return loss.item(), start_mem, end_mem, peak_mem
+        return loss.item(), 0, 0, 0
+
+    _ = test_optimization_step()
     
-    optimizer = Kron(model.parameters(), lr=0.01)
-    
-    x = torch.randn(2, 4, device=device)
-    y = torch.tensor([[1, 0], [0, 1]], device=device).float()
-    
-    output = model(x)
-    loss = torch.nn.functional.mse_loss(output, y)
-    
-    loss.backward()
-    
-    optimizer.step()
-    
-    print(f"Test complete - Loss: {loss.item():.3f}")
-    
-    if device == "cuda":
+    for i in range(3):
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+        loss, start_mem, end_mem, peak_mem = test_optimization_step()
+        
+        if device.type == 'cuda':
+            print(f"\nRun {i+1}:")
+            print(f"Start memory: {start_mem/1024**2:.2f} MB")
+            print(f"End memory: {end_mem/1024**2:.2f} MB") 
+            print(f"Peak memory: {peak_mem/1024**2:.2f} MB")
+            print(f"Memory delta: {(end_mem - start_mem)/1024**2:.2f} MB")
+        print(f"Loss: {loss:.4f}")
+
+    if device.type == 'cuda':
         torch.cuda.empty_cache()

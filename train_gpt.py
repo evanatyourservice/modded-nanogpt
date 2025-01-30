@@ -19,9 +19,6 @@ import torch.distributed as dist
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
 torch.set_float32_matmul_precision('high')
-from torch.backends import opt_einsum
-opt_einsum.set_flags(True, "optimal")
-print(f"opt_einsum enabled: {opt_einsum.enabled}, opt_einsum strategy: {opt_einsum.strategy}")
 
 from kron import Kron, precond_update_prob_schedule
 
@@ -513,7 +510,7 @@ class Hyperparameters:
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # muon optimizer settings
     muon_lr = 0.0005
-    warmup_steps = 200
+    warmup_steps = 100
     min_lr_frac = 0.1
     muon_momentum = 0.9
     muon_ns_steps = 5

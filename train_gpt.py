@@ -20,12 +20,8 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
 torch.set_float32_matmul_precision('high')
 from torch.backends import opt_einsum
-if opt_einsum.is_available():
-    opt_einsum.enabled = True
-    opt_einsum.strategy = "dp"
-    print("Using opt_einsum as einsum backend")
-else:
-    print("Warning: opt_einsum is not available")
+opt_einsum.set_flags(True, "optimal")
+print(f"opt_einsum enabled: {opt_einsum.enabled}, opt_einsum strategy: {opt_einsum.strategy}")
 
 from kron import Kron, precond_update_prob_schedule
 

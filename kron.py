@@ -2,8 +2,9 @@
 
 import string
 import random
-import numpy as np
 import time
+from contextlib import nullcontext
+import numpy as np
 
 import torch
 from torch import Tensor
@@ -94,6 +95,7 @@ class Kron(torch.optim.Optimizer):
             world_size = 1
         self.rank = rank
         self.world_size = world_size
+        self.is_distributed = world_size > 1 and dist.is_initialized()
 
         if preconditioner_update_probability is None:
             preconditioner_update_probability = precond_update_prob_schedule()
@@ -167,9 +169,10 @@ class Kron(torch.optim.Optimizer):
             while handles:
                 handle = handles.pop(0)
                 params_world = params_world_list.pop(0)
-                handle.wait()
+                if self.is_distributed:
+                    handle.wait()
                 for p_world, g_world in zip(params_world, update_buffer_views):
-                    with torch.cuda.stream(self.comm_stream):
+                    with torch.cuda.stream(self.comm_stream) if self.comm_stream else torch.cuda.stream(nullcontext()):
                         update = g_world.view_as(p_world)
                         if group["weight_decay"] > 0 and p_world.dim() >= 2:
                             update.add_(p_world, alpha=group["weight_decay"])
@@ -273,18 +276,12 @@ class Kron(torch.optim.Optimizer):
                     g = update_buffer_views[self.rank]
 
                 update_prev()
-                if self.world_size > 1 and self.device.type == "cuda":
-                    if self.comm_stream:
-                        with torch.cuda.stream(self.comm_stream):
-                            handle = dist.all_gather_into_tensor(
-                                update_buffer, g, async_op=True
-                            )
-                    else:
-                        handle = dist.all_gather_into_tensor(
-                            update_buffer, g, async_op=True
-                        )
+                if self.is_distributed and self.device.type == "cuda":
+                    handle = dist.all_gather_into_tensor(
+                        update_buffer, g, async_op=True
+                    )
                 else:
-                    update_buffer_views[0].copy_(g)
+                    update_buffer_views[0].copy_(g, non_blocking=True)
                     handle = None
                 
                 if handle is not None:
@@ -295,8 +292,6 @@ class Kron(torch.optim.Optimizer):
             if handles:
                 handles[0].wait()
 
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
         return loss
 
 

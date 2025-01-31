@@ -109,148 +109,6 @@ def lm_head_fp8(x: Tensor, w: Tensor) -> Tensor:
     return out.reshape(*x.shape[:-1], -1)
 
 # -----------------------------------------------------------------------------
-# Muon optimizer
-
-def _lb(A: Tensor, max_abs: Tensor):
-    A = A / max_abs
-    x = A[:, torch.max(torch.sum(A * A, dim=0), 0)[1]] @ A
-    return max_abs * torch.linalg.vector_norm((x / torch.linalg.vector_norm(x)) @ A.H)
-
-@torch.compiler.disable
-def norm_lower_bound(A: Tensor):
-    """Cheap lower bound for the spectral norm of A."""
-    max_abs = A.norm(float("inf"))
-    return torch.where(max_abs > 0, _lb(A, max_abs), max_abs)
-
-@torch.compile
-def psgd_whitening_like_muon(G: Tensor, Q: Tensor):
-    m, n = G.shape
-    if m < n:
-        G = G.T
-    V = torch.randn_like(G, dtype=torch.float32)
-    Bh = torch.linalg.solve_triangular(Q.float(), V, upper=True, left=False).bfloat16()  # roughly same complexity as a matmul
-    BBh = Bh.T @ Bh
-    A = G @ Q.bfloat16().T
-    AhA = A.T @ A
-    lr = torch.tensor(0.3, dtype=torch.bfloat16)
-    Q = Q - lr / norm_lower_bound(AhA + BBh) * torch.triu(AhA - BBh) @ Q
-    return Q
-
-@torch.compile
-def psgd_precondition_grads(G: Tensor, Q: Tensor):
-    m, n = G.shape
-    if m < n:
-        return torch.einsum('ji,jk,kl->il', Q, Q, G)
-    else:
-        return torch.einsum('ij,kj,kl->il', G, Q, Q)
-
-class Nuon(torch.optim.Optimizer):
-    """
-    Almost Muon, but Not.
-
-    Muon - MomentUm Orthogonalized by Newton-schulz
-
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
-
-    Some warnings:
-    - This optimizer assumes that all parameters passed in are 2D.
-    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
-    parameters; those should all be optimized by a standard method (e.g., AdamW).
-    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
-    - We believe it is unlikely to work well for training with small batch size.
-    - We believe it may not work well for finetuning pretrained models, but we haven"t tested this.
-    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
-
-    Arguments:
-        lr: The learning rate used by the internal SGD.
-        momentum: The momentum used by the internal SGD.
-        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
-        ns_steps: The number of Newton-Schulz iteration steps to use.
-        start_sparse_precond_updates: When to stop updating the preconditioner every step.
-    """
-    def __init__(self, params, lr=0.0003, momentum=0.9, nesterov=False, ns_steps=5, 
-                 start_sparse_precond_updates=1000, weight_decay=0.0, rank=0, world_size=1):
-        self.rank = rank
-        self.world_size = world_size
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps,
-                       start_sparse_precond_updates=start_sparse_precond_updates,
-                       weight_decay=weight_decay)
-        params: list[Tensor] = [*params]
-        assert all(isinstance(p, Tensor) for p in params)
-        sizes = {p.numel() for p in params}
-        def create_update_buffer(size: int):
-            b = torch.empty(self.world_size, size, dtype=torch.bfloat16, device="cuda")
-            return dict(update_buffer=b, update_buffer_views=[b[i] for i in range(self.world_size)])
-        param_groups = [
-            dict(params=[p for p in params if p.numel() == size], **create_update_buffer(size)) for size in sizes]
-        super().__init__(param_groups, defaults)
-
-    @torch.no_grad()
-    def step(self):
-        for group in self.param_groups:
-            lr = group["lr"]
-            momentum = group["momentum"]
-            nesterov = group["nesterov"]
-            ns_steps = group["ns_steps"]
-            start_sparse_precond_updates = group["start_sparse_precond_updates"]
-            weight_decay = group["weight_decay"]
-            update_buffer = group["update_buffer"]
-            update_buffer_views: list[Tensor] = group["update_buffer_views"]
-            # generate weight updates in distributed fashion
-            params: list[Tensor] = group["params"]
-            handle = None
-            params_world = None
-            def update_prev(): # optimized Muon implementation contributed by @YouJiacheng
-                if params_world is None:
-                    return
-                assert handle is not None
-                handle.wait()
-                for p_world, g_world in zip(params_world, update_buffer_views):
-                    grads = g_world.view_as(p_world)
-                    if weight_decay > 0:
-                        grads.add_(p_world, alpha=weight_decay)
-                    p_world.add_(grads, alpha=-lr)
-            for base_i in range(len(params))[::self.world_size]:
-                if base_i + self.rank < len(params):
-                    p = params[base_i + self.rank]
-                    g = p.grad
-                    assert g is not None
-                    state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                        state["step"] = 0
-                    state["step"] += 1
-                    step = state["step"]
-                    buf: Tensor = state["momentum_buffer"]
-                    buf.mul_(momentum).add_(g, alpha=1-momentum)  # ema momentum
-                    g = buf.div(1 - momentum ** step)
-                    orig_shape = g.shape
-                    g: Tensor = g.view(-1, orig_shape[-1])
-                    if 'Q' not in state:
-                        state['Q'] = torch.eye(min(g.shape), dtype=torch.bfloat16, device=g.device)
-                    g = g.bfloat16()
-                    # we don't have to update precond every step once loss is stable
-                    # if step < start_sparse_precond_updates or (step >= start_sparse_precond_updates and step % 5 == 0):
-                        # update preconditioner and precondition grads
-                    state['Q'] = psgd_whitening_like_muon(g, state['Q'])
-                    g = psgd_precondition_grads(g, state['Q'])
-                    rms = g.square().mean().sqrt()
-                    # if step % 250 == 0:
-                    #     print(f"RMS for shape {g.shape}: {rms}")
-                    if rms > 1.1:  # can clip at RMS 1.1
-                        g *= 1.1 / rms
-                    g = g.view(orig_shape).contiguous()
-                else:
-                    g = update_buffer_views[self.rank]
-                update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
-                handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
-                params_world = params[base_i : base_i + self.world_size]
-            update_prev()
-
-# -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
 
 def norm(x):
@@ -508,18 +366,18 @@ class Hyperparameters:
     batch_size = 8*64*1024 # batch size in tokens
     num_iterations = 7500 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
-    # muon optimizer settings
-    muon_lr = 0.003
+    # optimizer settings
+    optimizer_lr = 0.0005
     warmup_steps = 0
     min_lr_frac = 0.1
-    muon_momentum = 0.9
-    muon_ns_steps = 5
-    muon_weight_decay = 0.3
+    optimizer_momentum = 0.9
+    optimizer_ns_steps = 5
+    optimizer_weight_decay = 0.3
     max_size_triangular = 10000
     memory_save_mode = None
     precond_lr = 1.0
     precond_init_scale = 1.0
-    partition_grads = False
+    partition_grads = True
     block_size = 1024
     optimizer_dtype = torch.float32
     update_prob = 1 / 10
@@ -570,13 +428,13 @@ if master_process:
             "num_layers": 16,
             "num_heads": 8,
             "model_dim": 1024,
-            # muon optimizer
-            "muon_lr": args.muon_lr,
+            # optimizer
+            "optimizer_lr": args.optimizer_lr,
             "warmup_steps": args.warmup_steps,
             "min_lr_frac": args.min_lr_frac,
-            "muon_momentum": args.muon_momentum,
-            "muon_ns_steps": args.muon_ns_steps,
-            "muon_weight_decay": args.muon_weight_decay,
+            "optimizer_momentum": args.optimizer_momentum,
+            "optimizer_ns_steps": args.optimizer_ns_steps,
+            "optimizer_weight_decay": args.optimizer_weight_decay,
             "max_size_triangular": args.max_size_triangular,
             "memory_save_mode": args.memory_save_mode,
             "precond_lr": args.precond_lr,
@@ -642,9 +500,9 @@ for param in model.parameters():
 # optimizer1 = torch.optim.Adam(adam_params, betas=(args.adam_beta1, args.adam_beta2), fused=True, eps=args.adam_eps)
 optimizer2 = Kron(
     model.parameters(),
-    lr=args.muon_lr,
-    b1=args.muon_momentum,
-    weight_decay=args.muon_weight_decay,
+    lr=args.optimizer_lr,
+    b1=args.optimizer_momentum,
+    weight_decay=args.optimizer_weight_decay,
     preconditioner_update_probability=precond_update_prob_schedule(min_prob=args.update_prob),
     max_size_triangular=args.max_size_triangular,
     memory_save_mode=args.memory_save_mode,
@@ -739,10 +597,10 @@ for step in range(train_steps + 1):
         loss.backward()
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-    # momentum warmup for Muon
+    # momentum warmup
     # frac = min(step / 300, 1)
     # for group in optimizer2.param_groups:
-    #     group["momentum"] = (1 - frac) * 0.85 + frac * args.muon_momentum
+    #     group["momentum"] = (1 - frac) * 0.85 + frac * args.optimizer_momentum
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()

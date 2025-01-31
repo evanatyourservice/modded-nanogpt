@@ -36,6 +36,12 @@ def precond_update_prob_schedule(max_prob=1.0, min_prob=0.03, decay=0.001, flat_
     return _schedule
 
 
+def create_update_buffer(size: int, world_size: int, dtype: torch.dtype):
+    """Create buffer for distributed updates, using bfloat16 for communication."""
+    b = torch.empty(world_size, size, dtype=torch.bfloat16, device="cuda")
+    return dict(update_buffer=b, update_buffer_views=[b[i] for i in range(world_size)])
+
+
 class Kron(torch.optim.Optimizer):
     """Implements PSGD Kron with simple layer-wise pipeline parallelism.
 
@@ -98,13 +104,15 @@ class Kron(torch.optim.Optimizer):
 
         params = list(params)
         sizes = {p.numel() for p in params}
-        param_groups = [
-            dict(
-                params=[p for p in params if p.numel() == size],
+        param_groups = []
+        for size in sizes:
+            params_of_size = [p for p in params if p.numel() == size]
+            padded_len = ((len(params_of_size) + world_size - 1) // world_size) * world_size
+            params_of_size += [None] * (padded_len - len(params_of_size))
+            param_groups.append(dict(
+                params=params_of_size,
                 **create_update_buffer(size, self.world_size, dtype),
-            )
-            for size in sizes
-        ]
+            ))
 
         defaults = dict(
             lr=lr,
@@ -149,22 +157,20 @@ class Kron(torch.optim.Optimizer):
 
         balance = do_update and self.rng.random() < 0.01
 
-        handles = []
-        params_world_list = []
+        handle = None
+        params_world = None
 
-        def process_pending_updates():
-            while handles:
-                handle = handles.pop(0)
-                params_world = params_world_list.pop(0)
-                if params_world is None:
-                    continue
-                handle.wait()
-                views = update_buffer_views
-                with torch.cuda.stream(self.comm_stream):
-                    update = views[self.rank].view_as(params_world)
-                    if group["weight_decay"] > 0 and params_world.dim() >= 2:
-                        update.add_(params_world, alpha=group["weight_decay"])
-                    params_world.add_(update.to(dtype=params_world.dtype), alpha=-group["lr"])
+        def update_prev():
+            """Process pending updates in async fashion."""
+            if params_world is None:
+                return
+            assert handle is not None
+            handle.wait()
+            for p_world, g_world in zip(params_world, update_buffer_views):
+                grads = g_world.view_as(p_world)
+                if group["weight_decay"] > 0 and p_world.dim() >= 2:
+                    grads.add_(p_world, alpha=group["weight_decay"])
+                p_world.add_(grads, alpha=-group["lr"])
 
         for group in self.param_groups:
             update_buffer = group.get("update_buffer")
@@ -174,130 +180,127 @@ class Kron(torch.optim.Optimizer):
             update_buffer_views = group["update_buffer_views"]
             params = group["params"]
 
-            total_params = len(params)
-            for chunk_idx in range((total_params + self.world_size - 1) // self.world_size):
-                param_idx = chunk_idx * self.world_size + self.rank
-                if param_idx < total_params:
-                    p = params[param_idx]
-                    if p.grad is None:
-                        continue
-                    grads = p.grad.to(dtype=self.dtype)
-                    state = self.state[p]
+            # Process parameters in world_size chunks
+            for base_i in range(0, len(params), self.world_size):
+                chunk_params = params[base_i:base_i+self.world_size]
+                current_rank_has_param = base_i + self.rank < len(params)
+                
+                if current_rank_has_param:
+                    p = chunk_params[self.rank]
+                    if p is None:  # Handle padding
+                        g = torch.zeros_like(update_buffer_views[self.rank], dtype=self.dtype)
+                    else:
+                        if p.grad is None:
+                            continue
+                        grads = p.grad.to(dtype=self.dtype)
+                        state = self.state[p]
 
-                    # merge smaller dims
-                    if grads.dim() > 1:
-                        if "merged_shape" not in self.state[p]:
-                            shape1 = [np.prod(grads.shape[:-1]), grads.shape[-1]]
-                            shape2 = [grads.shape[0], np.prod(grads.shape[1:])]
-                            shape = shape1 if np.diff(shape1) <= np.diff(shape2) else shape2
-                            state["merged_shape"] = shape
+                        # merge smaller dims
+                        if grads.dim() > 1:
+                            if "merged_shape" not in self.state[p]:
+                                shape1 = [np.prod(grads.shape[:-1]), grads.shape[-1]]
+                                shape2 = [grads.shape[0], np.prod(grads.shape[1:])]
+                                shape = shape1 if np.diff(shape1) <= np.diff(shape2) else shape2
+                                state["merged_shape"] = shape
+                            else:
+                                shape = state["merged_shape"]
+                            grads = grads.view(*shape)
+
+                        # partition grads
+                        if self.defaults["partition_grads"]:
+                            if "partitioner" not in state:
+                                dim_diag = get_dim_diag(
+                                    self.defaults["memory_save_mode"],
+                                    grads.shape,
+                                    self.defaults["max_size_triangular"],
+                                    self.defaults["min_ndim_triangular"],
+                                )
+                                state["partitioner"] = BlockPartitioner(
+                                    grads.shape, self.defaults["block_size"], dim_diag
+                                )
+                            grads_list = state["partitioner"].partition(grads)
                         else:
-                            shape = state["merged_shape"]
-                        grads = grads.view(*shape)
+                            grads_list = [grads]
 
-                    # partition grads
-                    if self.defaults["partition_grads"]:
-                        if "partitioner" not in state:
-                            dim_diag = get_dim_diag(
-                                self.defaults["memory_save_mode"],
-                                grads.shape,
-                                self.defaults["max_size_triangular"],
-                                self.defaults["min_ndim_triangular"],
-                            )
-                            state["partitioner"] = BlockPartitioner(
-                                grads.shape, self.defaults["block_size"], dim_diag
-                            )
-                        grads_list = state["partitioner"].partition(grads)
-                    else:
-                        grads_list = [grads]
+                        precond_grads = []
+                        for i, grad in enumerate(grads_list):
+                            if f"step_{i}" not in state:
+                                state[f"step_{i}"] = 0
+                                state[f"momentum_buffer_{i}"] = torch.zeros_like(grad, dtype=self.dtype)
+                                dim_diag = get_dim_diag(
+                                    self.defaults["memory_save_mode"],
+                                    grads.shape,
+                                    self.defaults["max_size_triangular"],
+                                    self.defaults["min_ndim_triangular"],
+                                )
+                                state[f"Q_{i}"], state[f"exprs_{i}"] = _init_Q_exprs(
+                                    grad, self.defaults["precond_init_scale"], dim_diag, self.dtype
+                                )
 
-                    precond_grads = []
-                    for i, grad in enumerate(grads_list):
-                        if f"step_{i}" not in state:
-                            state[f"step_{i}"] = 0
-                            state[f"momentum_buffer_{i}"] = torch.zeros_like(grad, dtype=self.dtype)
-                            dim_diag = get_dim_diag(
-                                self.defaults["memory_save_mode"],
-                                grads.shape,
-                                self.defaults["max_size_triangular"],
-                                self.defaults["min_ndim_triangular"],
-                            )
-                            state[f"Q_{i}"], state[f"exprs_{i}"] = _init_Q_exprs(
-                                grad, self.defaults["precond_init_scale"], dim_diag, self.dtype
-                            )
+                            state[f"step_{i}"] += 1
 
-                        state[f"step_{i}"] += 1
+                            # momentum
+                            momentum_buffer = state[f"momentum_buffer_{i}"]
+                            beta = self.defaults["b1"]
+                            momentum_buffer.mul_(beta).add_(grad, alpha=1 - beta)
+                            debiased_momentum = momentum_buffer.div(1 - beta ** state[f"step_{i}"])
 
-                        # momentum
-                        momentum_buffer = state[f"momentum_buffer_{i}"]
-                        beta = self.defaults["b1"]
-                        momentum_buffer.mul_(beta).add_(grad, alpha=1 - beta)
-                        debiased_momentum = momentum_buffer.div(1 - beta ** state[f"step_{i}"])
+                            # balance Qs
+                            if grad.dim() > 1 and balance:
+                                _balance_Q(state[f"Q_{i}"])
 
-                        # balance Qs
-                        if grad.dim() > 1 and balance:
-                            _balance_Q(state[f"Q_{i}"])
+                            # update preconditioner
+                            if do_update:
+                                _update_precond(
+                                    state[f"Q_{i}"],
+                                    state[f"exprs_{i}"],
+                                    (
+                                        debiased_momentum
+                                        if self.defaults["momentum_into_precond_update"]
+                                        else grad
+                                    ),
+                                    torch.tensor(
+                                        self.defaults["precond_lr"], dtype=self.dtype, device="cuda"
+                                    ),
+                                    self._tiny,
+                                )
 
-                        # update preconditioner
-                        if do_update:
-                            _update_precond(
-                                state[f"Q_{i}"],
-                                state[f"exprs_{i}"],
-                                (
-                                    debiased_momentum
-                                    if self.defaults["momentum_into_precond_update"]
-                                    else grad
-                                ),
-                                torch.tensor(
-                                    self.defaults["precond_lr"], dtype=self.dtype, device="cuda"
-                                ),
-                                self._tiny,
+                            # precondition grads
+                            precond_grads.append(
+                                _precond_grad(state[f"Q_{i}"], state[f"exprs_{i}"], debiased_momentum)
                             )
 
-                        # precondition grads
-                        precond_grads.append(
-                            _precond_grad(state[f"Q_{i}"], state[f"exprs_{i}"], debiased_momentum)
+                        # merge partitions
+                        if self.defaults["partition_grads"]:
+                            g = state["partitioner"].merge_partitions(precond_grads)
+                        else:
+                            g = precond_grads[0]
+
+                        # clip grads at RMS 1.1
+                        g.mul_(
+                            torch.minimum(
+                                torch.tensor(1.0, dtype=self.dtype),
+                                1.1 / g.square().mean().sqrt().add(1e-6),
+                            )
                         )
 
-                    # merge partitions
-                    if self.defaults["partition_grads"]:
-                        g = state["partitioner"].merge_partitions(precond_grads)
-                    else:
-                        g = precond_grads[0]
+                        g = g.flatten()
+                        update_prev()
+                        with torch.cuda.stream(self.comm_stream):
+                            update_buffer_views[self.rank].copy_(g)
+                            handle = dist.all_gather_into_tensor(
+                                update_buffer, update_buffer_views[self.rank], async_op=True
+                            )
+                            params_world = [p for p in chunk_params if p is not None]
+                else:
+                    # Create zero gradient for ranks beyond parameter count
+                    g = torch.zeros_like(update_buffer_views[self.rank], dtype=self.dtype)
 
-                    # clip grads at RMS 1.1
-                    g.mul_(
-                        torch.minimum(
-                            torch.tensor(1.0, dtype=self.dtype),
-                            1.1 / g.square().mean().sqrt().add(1e-6),
-                        )
-                    )
+                update_prev()
 
-                    g = g.flatten()
-                    process_pending_updates()
-                    compute_event = torch.cuda.Event()
-                    compute_event.record()
-                    with torch.cuda.stream(self.comm_stream):
-                        compute_event.wait()
-                        update_buffer_views[self.rank].copy_(g)
-                        handle = dist.all_gather_into_tensor(
-                            update_buffer, update_buffer_views[self.rank], async_op=True
-                        )
-                        handles.append(handle)
-                        params_world_list.append(
-                            params[param_idx] if param_idx < total_params else None
-                        )
-            process_pending_updates()
-            if handles:
-                with torch.cuda.stream(self.comm_stream):
-                    handles[0].wait()
-                torch.cuda.current_stream().wait_stream(self.comm_stream)
+            update_prev()
+
         return loss
-
-
-def create_update_buffer(size: int, world_size: int, dtype: torch.dtype):
-    b = torch.empty(world_size, size, dtype=dtype, device="cuda")
-    return dict(update_buffer=b, update_buffer_views=b.unbind(0))
 
 
 def get_dim_diag(memory_save_mode, shape, max_size, min_ndim):

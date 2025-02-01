@@ -367,7 +367,7 @@ class Hyperparameters:
     num_iterations = 7500 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # optimizer settings
-    optimizer_lr = 0.0005
+    optimizer_lr = 0.0003
     warmup_steps = 0
     min_lr_frac = 0.1
     optimizer_momentum = 0.9
@@ -375,12 +375,16 @@ class Hyperparameters:
     optimizer_weight_decay = 0.3
     max_size_triangular = 10000
     memory_save_mode = None
-    precond_lr = 1.0
+    momentum_into_precond_update = True
+    precond_lr = 0.5
     precond_init_scale = 1.0
-    partition_grads = True
+    partition_grads = False
     block_size = 1024
+    mars = False
+    adam_grafting = False
+    clip_update_rms = True
     optimizer_dtype = torch.float32
-    update_prob = 1 / 10
+    update_prob = 1 / 5
     # adam optimizer settings
     head_lr = 0.003
     embed_lr = 0.3
@@ -437,10 +441,14 @@ if master_process:
             "optimizer_weight_decay": args.optimizer_weight_decay,
             "max_size_triangular": args.max_size_triangular,
             "memory_save_mode": args.memory_save_mode,
+            "momentum_into_precond_update": args.momentum_into_precond_update,
             "precond_lr": args.precond_lr,
             "precond_init_scale": args.precond_init_scale,
             "partition_grads": args.partition_grads,
             "block_size": args.block_size,
+            "mars": args.mars,
+            "adam_grafting": args.adam_grafting,
+            "clip_update_rms": args.clip_update_rms,
             "optimizer_dtype": args.optimizer_dtype,
             "update_prob": args.update_prob,
             # adam optimizer
@@ -503,14 +511,17 @@ optimizer2 = Kron(
     lr=args.optimizer_lr,
     b1=args.optimizer_momentum,
     weight_decay=args.optimizer_weight_decay,
-    preconditioner_update_probability=precond_update_prob_schedule(min_prob=args.update_prob),
+    preconditioner_update_probability=precond_update_prob_schedule(flat_start=1000, min_prob=args.update_prob),
     max_size_triangular=args.max_size_triangular,
     memory_save_mode=args.memory_save_mode,
-    momentum_into_precond_update=True,
+    momentum_into_precond_update=args.momentum_into_precond_update,
     precond_lr=args.precond_lr,
     precond_init_scale=args.precond_init_scale,
     partition_grads=args.partition_grads,
     block_size=args.block_size,
+    mars=args.mars,
+    adam_grafting=args.adam_grafting,
+    clip_update_rms=args.clip_update_rms,
     dtype=args.optimizer_dtype,
     rank=rank,
     world_size=world_size
@@ -518,16 +529,21 @@ optimizer2 = Kron(
 optimizers = [optimizer2]
 
 # learning rate schedule: stable then decay
+# def get_lr(it: int):
+#     warmup_steps = args.warmup_steps
+#     cooldown_start = args.num_iterations - int(args.num_iterations * args.cooldown_frac)
+#     if it < warmup_steps:
+#         return it / warmup_steps
+#     elif it >= cooldown_start:
+#         t = (it - cooldown_start) / (args.num_iterations - cooldown_start)
+#         return 1.0 - t * (1.0 - args.min_lr_frac)
+#     else:
+#         return 1.0
+
 def get_lr(it: int):
-    warmup_steps = args.warmup_steps
-    cooldown_start = args.num_iterations - int(args.num_iterations * args.cooldown_frac)
-    if it < warmup_steps:
-        return it / warmup_steps
-    elif it >= cooldown_start:
-        t = (it - cooldown_start) / (args.num_iterations - cooldown_start)
-        return 1.0 - t * (1.0 - args.min_lr_frac)
-    else:
-        return 1.0
+    progress = min(it / args.num_iterations, 1.0)
+    return 1.0 - progress * (1.0 - args.min_lr_frac)
+
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 @lru_cache(1)
 def sw_num_blks(window_size: int):
@@ -600,7 +616,7 @@ for step in range(train_steps + 1):
     # momentum warmup
     # frac = min(step / 300, 1)
     # for group in optimizer2.param_groups:
-    #     group["momentum"] = (1 - frac) * 0.85 + frac * args.optimizer_momentum
+    #     group["b1"] = (1 - frac) * 0.85 + frac * args.optimizer_momentum
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()

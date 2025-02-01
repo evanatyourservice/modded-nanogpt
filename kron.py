@@ -64,6 +64,9 @@ class Kron(torch.optim.Optimizer):
             matrices. Default: 1.0
         partition_grads (bool): Whether to partition gradients.
         block_size (int): Size of partitions for gradient partitioning.
+        mars (bool): Whether to use MARS.
+        adam_grafting (bool): Whether to graft adam's lr onto the update.
+        clip_update_rms (bool): Whether to clip the update RMS at 1.1.
         dtype (torch.dtype): Data type for parameters and gradients.
         rank (int): This worker's rank, used in pipeline partitioning.
         world_size (int): Total number of workers, used in pipeline partitioning.
@@ -84,6 +87,9 @@ class Kron(torch.optim.Optimizer):
         precond_init_scale=1.0,
         partition_grads=False,
         block_size=1024,
+        mars=False,
+        adam_grafting=False,
+        clip_update_rms=False,
         dtype=torch.float32,
         rank=0,
         world_size=1,
@@ -119,6 +125,9 @@ class Kron(torch.optim.Optimizer):
             precond_init_scale=precond_init_scale,
             partition_grads=partition_grads,
             block_size=block_size,
+            mars=mars,
+            adam_grafting=adam_grafting,
+            clip_update_rms=clip_update_rms,
             dtype=dtype,
         )
         super().__init__(param_groups, defaults)
@@ -160,7 +169,7 @@ class Kron(torch.optim.Optimizer):
                         update = g_world.view_as(p_world)
                         if group["weight_decay"] > 0 and p_world.dim() >= 2:
                             update.add_(p_world, alpha=group["weight_decay"])
-                        p_world.add_(update, alpha=-group["lr"])
+                        p_world.add_(update.to(p_world.dtype), alpha=-group["lr"])
                     pending_update = False
 
             num_params = len(group["params"])
@@ -186,6 +195,14 @@ class Kron(torch.optim.Optimizer):
                         else:
                             shape = state["merged_shape"]
                         grads = grads.view(*shape)
+                    
+                    beta = self.defaults["b1"]
+                    if self.defaults["mars"]:
+                        if "prev_grads" not in state:
+                            state["prev_grads"] = grads
+                        prev_grads = state["prev_grads"]
+                        state["prev_grads"] = grads.clone()
+                        grads.add_((beta / (1 - beta)) * (grads - prev_grads), alpha=0.025)  # alpha is mars gamma
 
                     # partition grads
                     if self.defaults["partition_grads"]:
@@ -208,6 +225,8 @@ class Kron(torch.optim.Optimizer):
                         if f"step_{i}" not in state:
                             state[f"step_{i}"] = 0
                             state[f"momentum_buffer_{i}"] = torch.zeros_like(grad, dtype=self.dtype)
+                            if self.defaults["adam_grafting"]:
+                                state[f"nu_{i}"] = torch.zeros_like(grad, dtype=self.dtype)
                             dim_diag = get_dim_diag(
                                 self.defaults["memory_save_mode"],
                                 grads.shape,
@@ -222,9 +241,14 @@ class Kron(torch.optim.Optimizer):
 
                         # momentum
                         momentum_buffer = state[f"momentum_buffer_{i}"]
-                        beta = self.defaults["b1"]
                         momentum_buffer.mul_(beta).add_(grad, alpha=1 - beta)
                         debiased_momentum = momentum_buffer.div(1 - beta ** state[f"step_{i}"])
+
+                        if self.defaults["adam_grafting"]:
+                            nu = state[f"nu_{i}"]
+                            nu.mul_(0.95).add_(grad**2, alpha=0.05)
+                            nu_hat = nu.div(1 - 0.95 ** state[f"step_{i}"])
+                            adam_update_norm = torch.linalg.norm(debiased_momentum / (nu_hat.sqrt() + 1e-8))
 
                         # balance Qs
                         if grad.dim() > 1 and balance:
@@ -247,9 +271,12 @@ class Kron(torch.optim.Optimizer):
                             )
 
                         # precondition grads
-                        precond_grads.append(
-                            _precond_grad(state[f"Q_{i}"], state[f"exprs_{i}"], debiased_momentum)
-                        )
+                        precond_grad = _precond_grad(state[f"Q_{i}"], state[f"exprs_{i}"], debiased_momentum)
+
+                        if self.defaults["adam_grafting"]:
+                            precond_grad.mul_(adam_update_norm / (precond_grad.norm() + 1e-12))
+
+                        precond_grads.append(precond_grad)
 
                     # merge partitions
                     if self.defaults["partition_grads"]:
@@ -258,12 +285,13 @@ class Kron(torch.optim.Optimizer):
                         g = precond_grads[0]
 
                     # clip update RMS at 1.1
-                    g.mul_(
-                        torch.minimum(
-                            torch.tensor(1.0, dtype=self.dtype),
-                            1.1 / g.square().mean().sqrt().add(1e-6),
+                    if self.defaults["clip_update_rms"]:
+                        g.mul_(
+                            torch.minimum(
+                                torch.tensor(1.0, dtype=self.dtype),
+                                1.1 / g.square().mean().sqrt().add(1e-12),
+                            )
                         )
-                    )
 
                     # flatten before all_gather
                     g_flat = g.flatten()
@@ -397,7 +425,7 @@ def _lb(A: Tensor, max_abs: Tensor):
 
 
 def _solve_triangular_right(X: Tensor, A: Tensor):
-    """X @ inv(A) with minimal float32 usage"""
+    """X @ inv(A)"""
     orig_dtype = A.dtype
     return (
         torch.linalg.solve_triangular(
@@ -407,16 +435,16 @@ def _solve_triangular_right(X: Tensor, A: Tensor):
             left=False,
             unitriangular=False,
         )
-        .reshape_as(X)
         .to(dtype=orig_dtype)
+        .reshape_as(X)
     )
 
 
 def _calc_A_and_conjB(exprA, G, Q):
     order = G.dim()
     V = torch.randn_like(G, device=G.device)
-    eps = torch.tensor(torch.finfo(torch.float32).eps, dtype=G.dtype, device=G.device)
-    G += eps.sqrt() * G.abs().mean() * V
+    # eps = torch.tensor(torch.finfo(torch.float32).eps, dtype=G.dtype, device=G.device)
+    # G += eps.sqrt() * G.abs().mean() * V
     conjB = V.permute(*range(1, order), 0)
     for i, q in enumerate(Q):
         conjB = conjB / q if q.dim() < 2 else _solve_triangular_right(conjB, q)

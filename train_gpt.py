@@ -375,16 +375,14 @@ class Hyperparameters:
     optimizer_weight_decay = 0.3
     max_size_triangular = 10000
     memory_save_mode = None
-    momentum_into_precond_update = True
     precond_lr = 0.5
     precond_init_scale = 1.0
     partition_grads = False
     block_size = 1024
-    mars = False
-    adam_grafting = False
     clip_update_rms = True
-    optimizer_dtype = torch.float32
-    update_prob = 1 / 5
+    optimizer_dtype = torch.bfloat16
+    flat_start = 500
+    update_prob = 1 / 10
     # adam optimizer settings
     head_lr = 0.003
     embed_lr = 0.3
@@ -441,15 +439,13 @@ if master_process:
             "optimizer_weight_decay": args.optimizer_weight_decay,
             "max_size_triangular": args.max_size_triangular,
             "memory_save_mode": args.memory_save_mode,
-            "momentum_into_precond_update": args.momentum_into_precond_update,
             "precond_lr": args.precond_lr,
             "precond_init_scale": args.precond_init_scale,
             "partition_grads": args.partition_grads,
             "block_size": args.block_size,
-            "mars": args.mars,
-            "adam_grafting": args.adam_grafting,
             "clip_update_rms": args.clip_update_rms,
             "optimizer_dtype": args.optimizer_dtype,
+            "flat_start": args.flat_start,
             "update_prob": args.update_prob,
             # adam optimizer
             "head_lr": args.head_lr,
@@ -511,16 +507,13 @@ optimizer2 = Kron(
     lr=args.optimizer_lr,
     b1=args.optimizer_momentum,
     weight_decay=args.optimizer_weight_decay,
-    preconditioner_update_probability=precond_update_prob_schedule(flat_start=1000, min_prob=args.update_prob),
+    preconditioner_update_probability=precond_update_prob_schedule(flat_start=args.flat_start, min_prob=args.update_prob),
     max_size_triangular=args.max_size_triangular,
     memory_save_mode=args.memory_save_mode,
-    momentum_into_precond_update=args.momentum_into_precond_update,
     precond_lr=args.precond_lr,
     precond_init_scale=args.precond_init_scale,
     partition_grads=args.partition_grads,
     block_size=args.block_size,
-    mars=args.mars,
-    adam_grafting=args.adam_grafting,
     clip_update_rms=args.clip_update_rms,
     dtype=args.optimizer_dtype,
     rank=rank,
@@ -529,20 +522,20 @@ optimizer2 = Kron(
 optimizers = [optimizer2]
 
 # learning rate schedule: stable then decay
-# def get_lr(it: int):
-#     warmup_steps = args.warmup_steps
-#     cooldown_start = args.num_iterations - int(args.num_iterations * args.cooldown_frac)
-#     if it < warmup_steps:
-#         return it / warmup_steps
-#     elif it >= cooldown_start:
-#         t = (it - cooldown_start) / (args.num_iterations - cooldown_start)
-#         return 1.0 - t * (1.0 - args.min_lr_frac)
-#     else:
-#         return 1.0
-
 def get_lr(it: int):
-    progress = min(it / args.num_iterations, 1.0)
-    return 1.0 - progress * (1.0 - args.min_lr_frac)
+    cooldown_start = args.num_iterations - int(args.num_iterations * args.cooldown_frac)
+    if it < args.warmup_steps:
+        return it / args.warmup_steps
+    elif it >= cooldown_start:
+        t = (it - cooldown_start) / (args.num_iterations - cooldown_start)
+        return 1.0 - t * (1.0 - args.min_lr_frac)
+    else:
+        return 1.0
+
+# linear
+# def get_lr(it: int):
+#     progress = min(it / args.num_iterations, 1.0)
+#     return 1.0 - progress * (1.0 - args.min_lr_frac)
 
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 @lru_cache(1)
@@ -551,9 +544,13 @@ def sw_num_blks(window_size: int):
 
 model: nn.Module = torch.compile(model)
 training_time_ms = 0
+train_log_freq = 20
 # start the clock
 torch.cuda.synchronize()
 t0 = time.perf_counter()
+start_time = time.time()
+time_last_n = 0
+step_time = 0
 # begin training
 train_steps = args.num_iterations
 for step in range(train_steps + 1):
@@ -591,7 +588,7 @@ for step in range(train_steps + 1):
         if master_process:
             to_log = {"val_loss": val_loss.item(), "step": step, "train_time_ms": training_time_ms}
             if timed_steps > 1:
-                to_log["step_time_ms"] = training_time_ms/(timed_steps-1)
+                to_log["avg_step_time_ms"] = training_time_ms/(timed_steps-1)
             wandb.log(to_log, step=step)
         model.train()
         # start the clock again
@@ -624,11 +621,17 @@ for step in range(train_steps + 1):
     # null the gradients
     model.zero_grad(set_to_none=True)
     # logging
-    if step % 10 == 0 and master_process:
+    if step % train_log_freq == 0 and master_process:
         current_lr_multiplier = get_lr(step)
-        wandb.log({"loss": loss.item(), "lr_multiplier": current_lr_multiplier}, step=step)
+        to_log = {"loss": loss.item(), "lr_multiplier": current_lr_multiplier}
+        time_last_n = time.time() - start_time
+        step_time = time_last_n * 1000 / train_log_freq
+        if step > 1:
+            to_log["step_time_ms"] = step_time
+        wandb.log(to_log, step=step)
+        start_time = time.time()
     approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms loss:{loss:.4f}", console=True)
+    print0(f"step:{step+1}/{train_steps} train_time:{approx_time:.0f}ms step_time:{step_time:.2f}ms step_avg:{approx_time/timed_steps:.2f}ms loss:{loss:.4f}", console=True)
 
 print0(
     f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
